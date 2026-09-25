@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "apps": [
+    {
+      "id": "_generic",
+      "name": "Generic self-hosted app",
+      "template": "apps/_generic/runbook.md",
+      "extra_docs": [
+        "apps/_generic/persistence-method.md"
+      ],
+      "scripts": [
+        "scripts/restore-guard",
+        "scripts/am-validate"
+      ],
+      "summary": "Base runbook and registry schema for any self-hosted app: install-if-missing, persistence, safe restore, gated upgrades."
+    },
+    {
+      "id": "tailscale",
+      "name": "Tailscale",
+      "template": "apps/tailscale/runbook.md",
+      "scripts": [
+        "scripts/tailscale-launcher",
+        "scripts/taildrop-fetch",
+        "scripts/taildrop-cleanup",
+        "scripts/restore-guard"
+      ],
+      "summary": "Keeps the same node identity across resets, owner login choice, shared Taildrop inbox with opt-in retention."
+    },
+    {
+      "id": "syncthing",
+      "name": "Syncthing",
+      "template": "apps/syncthing/runbook.md",
+      "scripts": [
+        "scripts/syncthing-launcher",
+        "scripts/syncthing-snapshot",
+        "scripts/restore-guard"
+      ],
+      "summary": "Newest stable from GitHub, durable device ID/DB/folders, owner-confirmed pairing, never auto-accepts devices or folders."
+    }
+  ],
+  "scripts": [
+    {
+      "path": "scripts/am-validate",
+      "purpose": "Read-only sanity validator for the app-management registry and records; prints REFUSE/WARN/OK findings, never prints secrets. Exit 2 REFUSE, 1 unconfirmed WARN, 0 clean.",
+      "sha256": "b8550524170daf307d0b356361f5ea33d3cd3b62400d18e60cac77935e3db877"
+    },
+    {
+      "path": "scripts/restore-guard",
+      "purpose": "Restore safeguards: preflight, link (moves existing items aside), rollback, commit, prune (max two leftovers per path, never in-use items). Never deletes or overwrites existing data.",
+      "sha256": "ddc8c8eb3f2511846e69af1e639c0389c2a68f359770cba7b61bcfd297300665"
+    },
+    {
+      "path": "scripts/syncthing-launcher",
+      "purpose": "Syncthing start launcher: installs/upgrades nothing, re-seeds identity only if missing, never touches the DB, runs with --no-upgrade and optional memory caps.",
+      "sha256": "bf362252c20c80282ec281894f4eca2408870dd127b5fe265334d6421cc62b26"
+    },
+    {
+      "path": "scripts/syncthing-snapshot",
+      "purpose": "Syncthing cold-copy helper: essentials only (cert/key/config), max two dirs, only when healthy; refuses unsafe, synced, DB, or unmarked destinations.",
+      "sha256": "438a3475f3ae41668f2d364e449ffc2a69bc7eb68fc14da834f33c8452ebc2bd"
+    },
+    {
+      "path": "scripts/taildrop-cleanup",
+      "purpose": "Retention cleanup for the marked Taildrop inbox only; deletes files older than taildrop_retention_days; refuses unsafe, synced, unmarked, or state-holding dirs.",
+      "sha256": "ea0951a765f8bb8e4d79e29141ad6e15bc2a08ad1adab04508cee71ec03e5203"
+    },
+    {
+      "path": "scripts/taildrop-fetch",
+      "purpose": "Moves received Taildrop files into a marked shared inbox under durable_root; optional idempotent --loop; refuses unsafe, synced, or unmarked dirs.",
+      "sha256": "fa6a851d0fde986ed2e00272462b61f3d00f1eff255ad33adef05d713c2c0353"
+    },
+    {
+      "path": "scripts/tailscale-launcher",
+      "purpose": "Tailscale launcher: installs only if missing (never upgrades), re-seeds state from cold copy, starts tailscaled, treats NeedsLogin as a failed restore, refreshes the cold copy when healthy.",
+      "sha256": "7c55be95334af1d9547007e4fd6e7b3e1c4c903c5a3454e3082ac1ed4450b307"
+    }
+  ]
+}
