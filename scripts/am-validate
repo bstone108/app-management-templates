@@ -1,0 +1,154 @@
+#!/bin/bash
+# app-management sanity validator: READ-ONLY. Prints REFUSE / WARN / OK findings.
+# Usage: am-validate <app_dir>          (reads <app_dir>/registry.* and <app_dir>/apps/*.md)
+# Exit: 2 = at least one REFUSE, 1 = at least one unconfirmed WARN, 0 = clean.
+# Never prints secret values: secret scans report file:line only; config files are only counted with grep -c.
+set -uo pipefail
+APP_DIR="${1:?usage: am-validate <app_dir>}"
+NREF=0; NWARN=0
+SYS_DIRS="/ /bin /boot /dev /etc /home /lib /lib64 /opt /proc /root /run /sbin /srv /sys /tmp /usr /var"
+
+yblock() {  # print the YAML block of a record (between the fence lines; fence built at runtime so this script can live inside markdown)
+  awk -v f="$(printf '\140\140\140')" 'index($0,f"yaml")==1{y=1;next} index($0,f)==1{y=0} y' "$1"
+}
+val() {  # scalar value of <key> in the YAML block of record <file>
+  yblock "$1" | awk -v k="$2" '$0 ~ "^"k":" {sub("^"k":[ ]*","");sub(/[ ]+#.*$/,"");gsub(/^["\x27]|["\x27]$/,"");print;exit}'
+}
+rp() { case "$1" in ""|"<"*|none|null|"[]") return 1;; esac; realpath -m -- "${1/#\~/$HOME}"; }
+inside() { [ "$1" = "$2" ] || case "$1/" in "$2"/*) return 0;; *) return 1;; esac; }  # $1 inside or equal $2
+confirmed=""
+say() {  # level app id message
+  local lvl=$1 app=$2 id=$3; shift 3
+  if [ "$lvl" = WARN ] && printf '%s\n' $confirmed | grep -qxF -- "$id"; then lvl="OK"; set -- "$* (owner-confirmed risk)"; fi
+  case $lvl in REFUSE) NREF=$((NREF+1));; WARN) NWARN=$((NWARN+1));; esac
+  printf '%-6s %-12s %-40s %s\n' "$lvl" "$app" "$id" "$*"
+}
+synced_ancestor() {  # prints the synced-folder root that contains $1 (via .stfolder), if any
+  local d=$1; while :; do [ -e "$d/.stfolder" ] && { echo "$d"; return 0; }; [ "$d" = / ] && return 1; d=$(dirname "$d"); done
+}
+
+# ---- secret values in the registry and records (refuse; file:line only) ----
+SECRET_RE='tskey-[a-z]+-[A-Za-z0-9]{6,}|-----BEGIN [A-Z ]*PRIVATE KEY|<apikey>[^<]{8,}|(api_?key|auth_?key|password|token): *[A-Za-z0-9_+/=-]{16,}'
+for f in "$APP_DIR"/registry.* "$APP_DIR"/apps/*.md; do
+  [ -f "$f" ] || continue
+  while read -r ln; do [ -n "$ln" ] && say REFUSE registry "secret-in-registry:${f##*/}:$ln" "a secret value is written in ${f##*/} line $ln; move it to a private secret location and keep only the path"
+  done < <(grep -nE "$SECRET_RE" "$f" 2>/dev/null | cut -d: -f1)
+done
+
+declare -A STATE_OWNER=()
+ALL_DATA=()
+for rec in "$APP_DIR"/apps/*.md; do  # collect every synced data folder first
+  [ -f "$rec" ] || continue
+  while read -r p; do q=$(rp "$p") && ALL_DATA+=("$q"); done < <(yblock "$rec" | awk '/^data_folders:/{d=1} d&&/^[a-z_]+:/&&!/^data_folders:/{d=0} d' | grep -oE 'path: *[^,}]+' | sed 's/^path: *//')
+done
+
+# secrets inside synced data folders (by name; never read contents)
+for d in "${ALL_DATA[@]}"; do [ -d "$d" ] || continue
+  while read -r f; do [ -n "$f" ] && say REFUSE synced "secret-in-synced:${f##*/}" "$f looks like a private key/state inside a synced folder"; done < <(find "$d" -maxdepth 4 -type f \( -name 'key.pem' -o -name '*.key' -o -name '*.state' -o -name 'id_rsa' -o -name 'id_ed25519' \) 2>/dev/null | head -5)
+done
+
+for rec in "$APP_DIR"/apps/*.md; do
+  [ -f "$rec" ] || continue
+  app=$(val "$rec" name); app=${app:-$(basename "$rec" .md)}
+  confirmed=$(yblock "$rec" | awk '/^owner_confirmed_risks:/' | grep -oE 'risk: *[^,}]+' | sed 's/^risk: *//')
+  DR=$(rp "$(val "$rec" durable_root)") || { say WARN "$app" no-durable-root "durable_root is not set in the record"; DR=""; }
+
+  # durable_root itself
+  if [ -n "$DR" ]; then
+    for s in $SYS_DIRS "$HOME"; do [ "$DR" = "$(realpath -m "$s")" ] && say REFUSE "$app" durable-root-is-system "durable_root is $DR (a system/home dir); pick a dedicated folder"; done
+    [ -d "$DR" ] || say WARN "$app" durable-root-missing "durable_root $DR does not exist"
+    fs=$(findmnt -n -o FSTYPE -T "$DR" 2>/dev/null)
+    case "$fs" in tmpfs|ramfs) say WARN "$app" durable-root-volatile "durable_root is on $fs, which is wiped at reboot/reset";;
+      *) say OK "$app" durable-root-fs "durable_root is on '$fs'; the filesystem type alone can't prove it survives a reset, so keep evidence in the registry";; esac
+    case "$DR/" in /tmp/*|/run/*|/dev/shm/*) say WARN "$app" durable-root-volatile "durable_root is under a temporary dir";; esac
+    [ -n "$(synced_ancestor "$DR")" ] && say REFUSE "$app" durable-root-in-synced "durable_root is inside a synced folder: state and keys would be shared"
+  fi
+
+  # role -> path
+  declare -A P=()
+  for k in state_dir config_dir db_dir cold_copy_dir cold_copy_extra taildrop_dir; do q=$(rp "$(val "$rec" "$k")") && P[$k]=$q; done
+  q=$(rp "$(val "$rec" log_path)") && P[log_path]=$q
+
+  for k in "${!P[@]}"; do
+    p=${P[$k]}
+    # equal to /, $HOME, durable_root, or a system dir
+    for s in $SYS_DIRS "$HOME" "$DR"; do
+      [ -n "$s" ] && [ "$p" = "$(realpath -m "$s")" ] || continue
+      case $k in cold_copy_dir|cold_copy_extra|taildrop_dir) say REFUSE "$app" "path-is-system:$k" "$k is $p; copy/cleanup scripts would write or delete there";;
+                 *) say WARN "$app" "path-is-system:$k" "$k is $p; it should be a dedicated folder";; esac
+    done
+    # outside durable_root (live data would not survive a reset)
+    case $k in state_dir|config_dir|db_dir|taildrop_dir)
+      [ -n "$DR" ] && ! inside "$p" "$DR" && say WARN "$app" "not-durable:$k" "$k ($p) is outside durable_root; it will not survive a reset";; esac
+    # inside a synced folder (by marker or by record)
+    sa=$(synced_ancestor "$p"); for d in "${ALL_DATA[@]}"; do inside "$p" "$d" && sa=${sa:-$d}; done
+    if [ -n "$sa" ]; then
+      case $k in state_dir|config_dir|db_dir|cold_copy_dir|cold_copy_extra)
+               say REFUSE "$app" "in-synced:$k" "$k ($p) is inside synced folder $sa: keys/state would be copied to other devices (and a DB there gets corrupted)";;
+               *) say WARN "$app" "in-synced:$k" "$k ($p) is inside synced folder $sa: its files will sync to other devices";; esac
+    fi
+    # synced data folder inside this path (a cleanup/prune there could delete synced data)
+    for d in "${ALL_DATA[@]}"; do [ "$d" != "$p" ] && inside "$d" "$p" && case $k in cold_copy_dir|cold_copy_extra|taildrop_dir|state_dir|config_dir|db_dir)
+      say WARN "$app" "contains-synced:$k" "synced folder $d is inside $k ($p)";; esac; done
+    # cleanup/copy targets must be marked
+    case $k in
+      cold_copy_dir|cold_copy_extra) [ -d "$p" ] && [ -n "$(find "$p" -mindepth 1 \( -name '*.pre-restore-*' -o -name '*.failed-restore-*' -o -name '*.journal*' \) -print -quit 2>/dev/null)" ] && say WARN "$app" "nested-backup:$k" "$k ($p) contains restore leftovers (.pre-restore / journals); cold copies must hold essentials only"
+        [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ] && [ ! -e "$p/.app-mgmt-cold-copy" ] && say WARN "$app" "unmarked:$k" "$k ($p) has files but no .app-mgmt-cold-copy marker; guarded copy/prune helpers will refuse it";;
+      taildrop_dir) [ -d "$p" ] && [ ! -e "$p/.taildrop-inbox" ] && say WARN "$app" "unmarked:$k" "$k ($p) has no .taildrop-inbox marker; cleanup will refuse it";;
+    esac
+  done
+  # nesting between roles of the same app
+  for a in "${!P[@]}"; do for b in "${!P[@]}"; do
+    [ "$a" \< "$b" ] || continue
+    pa=${P[$a]}; pb=${P[$b]}
+    case "$a+$b" in config_dir+db_dir|config_dir+state_dir|db_dir+state_dir) [ "$pa" = "$pb" ] && continue;; esac   # some apps share one dir on purpose
+    if inside "$pa" "$pb" || inside "$pb" "$pa"; then
+      say WARN "$app" "nested:$a:$b" "$a ($pa) and $b ($pb) overlap; copying, syncing or cleaning one would touch the other"
+    fi
+  done; done
+  # two apps sharing a state dir
+  for k in state_dir config_dir db_dir; do p=${P[$k]:-}; [ -n "$p" ] || continue
+    if [ -n "${STATE_OWNER[$p]:-}" ] && [ "${STATE_OWNER[$p]}" != "$app" ]; then say WARN "$app" "shared-state:$k" "$k ($p) is also used by ${STATE_OWNER[$p]}"; else STATE_OWNER[$p]=$app; fi
+  done
+
+  # permissions: private keys / state readable by others (refuse), dirs open to others (warn)
+  for k in state_dir config_dir cold_copy_dir cold_copy_extra; do p=${P[$k]:-}; [ -d "${p:-/nonexistent}" ] || continue
+    while read -r f; do [ -n "$f" ] && say REFUSE "$app" "world-readable:${f##*/}" "$f is readable by every user; chmod 600 it (owner decides)"; done < <(find "$p" -maxdepth 2 -type f \( -name 'key.pem' -o -name '*-key.pem' -o -name '*.key' -o -name '*.state' -o -name '*.state.prev' -o -name 'config.xml' -o -name 'auth*key*' \) -perm -o+r 2>/dev/null)
+    [ "$(( 0$(stat -c %a "$p") & 7 ))" -ne 0 ] && say WARN "$app" "dir-open:$k" "$k ($p) has 'other' permissions $(stat -c %a "$p"); 700 is safer"
+  done
+  # GUI/API bind address and auth
+  addr=$(val "$rec" api_address)
+  if [ -n "$addr" ]; then
+    live=""; cx="${P[config_dir]:-}/config.xml"
+    [ -f "$cx" ] && live=$(sed -n '/<gui/,/<\/gui>/p' "$cx" | grep -o '<address>[^<]*' | head -1 | sed 's/<address>//')
+    for a in $(printf "%s\n" "$addr" $live | sort -u); do
+      host=${a%:*}; host=${host#[}; host=${host%]}
+      case "$host" in 127.*|::1|localhost) kind=loopback;; 0.0.0.0|::|"") kind=all;; 100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) kind=tailnet;;
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) kind=lan;; *) kind=public;; esac
+      [ "$kind" = loopback ] && { say OK "$app" "bind:$a" "API/GUI listens on loopback only"; continue; }
+      auth=$(val "$rec" api_auth); authok=unknown
+      if [ -f "$cx" ]; then  # count only, never print
+        u=$(sed -n '/<gui/,/<\/gui>/p' "$cx" | grep -c '<user>[^<]'); pw=$(sed -n '/<gui/,/<\/gui>/p' "$cx" | grep -c '<password>[^<]')
+        [ "$u" -gt 0 ] && [ "$pw" -gt 0 ] && authok=yes || authok=no
+      fi
+      [ "$auth" = none ] && authok=no
+      if [ "$authok" = no ] && [ "$kind" != tailnet ]; then say REFUSE "$app" "bind-noauth:$a" "API/GUI listens on $a ($kind) with no GUI user/password; anyone who reaches it can read the API key and add devices"
+      else say WARN "$app" "bind-exposed:$a" "API/GUI listens on $a ($kind); auth=$authok. Loopback (127.0.0.1) is safest"; fi
+    done
+  fi
+
+  # retention and cold copy count
+  r=$(val "$rec" taildrop_retention_days)
+  case "$r" in ""|off) ;; *[!0-9]*) say WARN "$app" retention-invalid "taildrop_retention_days '$r' is not a number or off";;
+    *) [ "$r" -lt 1 ] && say WARN "$app" retention-short "taildrop_retention_days $r deletes files before anyone can pick them up";; esac
+  m=$(val "$rec" cold_copy_max)
+  case "$m" in ""|*[!0-9]*) ;; *) { [ "$m" -lt 1 ] || [ "$m" -gt 2 ]; } && say WARN "$app" cold-copy-max "cold_copy_max $m is outside 1..2";; esac
+  # versions
+  pin=$(val "$rec" pinned_version); inst=$(val "$rec" installed_version)
+  case "$(val "$rec" runbook_skill)" in syncthing*) case "$pin$inst" in *v1.*|1.*) say WARN "$app" version-eol "Syncthing 1.x is pinned/installed; 2.x is current";; esac;; esac
+  [ -n "$pin" ] && [ "$pin" != latest ] && say WARN "$app" "pinned:$pin" "pinned to $pin; confirm it is not end-of-life and not below the installed DB version"
+  unset P
+  say OK "$app" checked "record $rec validated"
+done
+echo "summary: REFUSE=$NREF WARN=$NWARN"
+[ "$NREF" -gt 0 ] && exit 2; [ "$NWARN" -gt 0 ] && exit 1; exit 0
