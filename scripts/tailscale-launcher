@@ -1,0 +1,80 @@
+#!/bin/bash
+# Usage: tailscale-launcher <path to apps/tailscale.md>
+set -euo pipefail
+RECORD="${1:?instance record path}"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
+STATE_DIR=$(rec state_dir); SOCK=$(rec socket_path); LOG=$(rec log_path)
+COLD=$(rec cold_copy_dir); NODE=$(rec node_name); MODE=$(rec run_mode); PIN=$(rec pinned_version)
+LOG_MAX_MB=$(rec log_max | tr -dc 0-9); LOG_MAX=$(( ${LOG_MAX_MB:-5} * 1024 * 1024 ))
+STATE="$STATE_DIR/tailscaled.state"
+if [ "$MODE" = "userspace" ]; then SUDO=""; TUN="userspace-networking"; else SUDO="sudo"; TUN="tailscale0"; fi
+ts() { $SUDO tailscale --socket="$SOCK" "$@"; }
+
+install_if_missing() {
+  dpkg -s tailscale >/dev/null 2>&1 && { command -v tailscaled >/dev/null || [ -x /usr/sbin/tailscaled ]; } && return 0
+  . /etc/os-release   # distro-aware: ID + VERSION_CODENAME, never hardcoded
+  if curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.noarmor.gpg" \
+       | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null &&
+     curl -fsSL "https://pkgs.tailscale.com/stable/${ID}/${VERSION_CODENAME}.tailscale-keyring.list" \
+       | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null; then
+    sudo apt-get update -qq
+    if [ -n "$PIN" ] && [ "$PIN" != "latest" ]; then
+      sudo apt-get install -y -qq "tailscale=$PIN" && sudo apt-mark hold tailscale
+    else
+      sudo apt-get install -y -qq tailscale
+    fi
+  else
+    curl -fsSL https://tailscale.com/install.sh | sh   # official script; then pin/hold if required
+  fi
+}
+TSD=""
+
+cold_restore() {
+  for src in "$COLD/tailscaled.state" "$COLD/tailscaled.state.prev"; do
+    if $SUDO test -s "$src"; then
+      $SUDO cp "$src" "$STATE"; $SUDO chmod 600 "$STATE"; echo "restored state from $src"; return 0
+    fi
+  done
+  echo "no cold copy available" >&2; return 1
+}
+
+cap_log() {
+  $SUDO mkdir -p "$(dirname "$LOG")"
+  local sz; sz=$($SUDO stat -c%s "$LOG" 2>/dev/null || echo 0)
+  if [ "$sz" -gt "$LOG_MAX" ]; then $SUDO sh -c "tail -c 1048576 '$LOG' > '$LOG.1' && truncate -s 0 '$LOG'"; fi
+}
+
+start_daemon() {
+  $SUDO mkdir -p "$STATE_DIR" "$(dirname "$SOCK")"; $SUDO chmod 700 "$STATE_DIR"; $SUDO rm -f "$SOCK"
+  $SUDO sh -c "nohup '$TSD' --statedir='$STATE_DIR' --socket='$SOCK' --tun='$TUN' >>'$LOG' 2>&1 &"
+  for _ in $(seq 1 40); do $SUDO test -S "$SOCK" && return 0; sleep 0.25; done
+  echo "socket did not appear; see $LOG" >&2; return 1
+}
+
+needs_login() { ts status 2>&1 | grep -qiE 'NeedsLogin|logged out|Log in at'; }
+
+install_if_missing                     # never upgrades
+TSD=$(command -v tailscaled || echo /usr/sbin/tailscaled)
+[ "$($SUDO stat -c%s "$STATE" 2>/dev/null || echo 0)" -ge 100 ] || cold_restore || true
+cap_log
+pgrep -x tailscaled >/dev/null || start_daemon
+if needs_login; then                   # restore failure, not a routine login
+  $SUDO pkill -x tailscaled || true; sleep 1
+  cold_restore || true
+  start_daemon                         # keep the node up while escalating
+  if needs_login; then echo "RESTORE_FAILED: escalate as incident" >&2; exit 2; fi
+fi
+ts set --hostname="$NODE" || true
+
+# Cold copy: essentials only, current + .prev, cmp-verified, only when healthy.
+if ts ip -4 >/dev/null 2>&1 && ! needs_login; then
+  $SUDO mkdir -p "$COLD"; $SUDO chmod 700 "$COLD"
+  if ! $SUDO cmp -s "$STATE" "$COLD/tailscaled.state"; then
+    if $SUDO test -f "$COLD/tailscaled.state"; then $SUDO mv -f "$COLD/tailscaled.state" "$COLD/tailscaled.state.prev"; fi
+    tmp=$($SUDO mktemp "$COLD/.state.XXXXXX"); $SUDO cp "$STATE" "$tmp"
+    if $SUDO cmp -s "$STATE" "$tmp"; then $SUDO mv -f "$tmp" "$COLD/tailscaled.state"; else $SUDO rm -f "$tmp"; fi
+  fi
+  $SUDO find "$COLD" -maxdepth 1 -type f ! -name tailscaled.state ! -name tailscaled.state.prev -delete  # dedicated dir: max two
+  $SUDO sh -c "chmod 600 '$COLD'/tailscaled.state*"
+fi
+ts status
