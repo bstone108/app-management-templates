@@ -1,0 +1,19 @@
+#!/bin/bash
+# Usage: taildrop-cleanup <path to apps/tailscale.md>
+set -euo pipefail
+RECORD="${1:?instance record path}"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
+DIR=$(rec taildrop_dir); DAYS=$(rec taildrop_retention_days); ROOT=$(rec durable_root)
+MARK=".taildrop-inbox"
+case "$DAYS" in ''|off|OFF) echo "retention off"; exit 0 ;; *[!0-9]*) echo "bad taildrop_retention_days" >&2; exit 1 ;; esac
+[ -n "$DIR" ] && [ -d "$DIR" ] && [ -n "$ROOT" ] || { echo "taildrop_dir missing" >&2; exit 1; }
+real=$(realpath "$DIR"); rroot=$(realpath "$ROOT")
+case "$real" in "$rroot"/?*) ;; *) echo "refusing: $real not under durable_root" >&2; exit 1 ;; esac
+[ "$real" != "$rroot" ] && [ "$real" != "$HOME" ] || { echo "refusing unsafe dir" >&2; exit 1; }
+[ -e "$real/$MARK" ] || { echo "refusing: $real has no $MARK marker" >&2; exit 1; }
+d=$real; while [ "$d" != / ]; do [ -e "$d/.stfolder" ] && { echo "$real is inside synced folder $d; refusing" >&2; exit 1; }; d=$(dirname "$d"); done
+if [ -n "$(find "$real" -maxdepth 3 \( -name 'index-v2*' -o -name '*.state' -o -name cert.pem \) -print -quit)" ]; then
+  echo "refusing: $real contains app state (index-v2 / *.state / cert.pem)" >&2; exit 1
+fi
+find "$real" -xdev -type f ! -name "$MARK" -mtime +"$DAYS" -print -delete
+find "$real" -xdev -mindepth 1 -type d -empty -delete
