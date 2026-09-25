@@ -1,0 +1,36 @@
+#!/bin/bash
+# Usage: taildrop-fetch <path to apps/tailscale.md> [--loop]
+set -euo pipefail
+RECORD="${1:?instance record path}"; MODE_ARG="${2:-}"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
+SOCK=$(rec socket_path); DIR=$(rec taildrop_dir); GROUP=$(rec taildrop_group); ROOT=$(rec durable_root)
+MARK=".taildrop-inbox"
+[ -n "$DIR" ] && [ -n "$ROOT" ] || { echo "taildrop_dir/durable_root not set" >&2; exit 1; }
+real=$(realpath -m "$DIR"); rroot=$(realpath -m "$ROOT")
+case "$real" in "$rroot"/?*) ;; *) echo "refusing: $real not under durable_root" >&2; exit 1 ;; esac
+[ "$real" != "$rroot" ] && [ "$real" != "$HOME" ] || { echo "refusing unsafe dir" >&2; exit 1; }
+d=$real; while [ "$d" != / ]; do [ -e "$d/.stfolder" ] && { echo "$real is inside synced folder $d; refusing" >&2; exit 1; }; d=$(dirname "$d"); done
+if [ -d "$real" ] && [ -n "$(ls -A "$real")" ] && [ ! -e "$real/$MARK" ]; then
+  echo "refusing: $real is non-empty and not a marked Taildrop inbox" >&2; exit 1
+fi
+umask 007; mkdir -p "$real"; chgrp "$GROUP" "$real" 2>/dev/null || true; chmod 2770 "$real"; touch "$real/$MARK"
+PAT="^(sudo )?tailscale .*file get .*--loop.* $real\$"
+if [ "$MODE_ARG" = "--loop" ] && pgrep -f -- "$PAT" >/dev/null; then echo "fetch loop already running"; exit 0; fi
+# Try unprivileged first (works when this user is the Tailscale operator or in userspace mode);
+# fall back to sudo only on an access-denied error. (Do not read `tailscale debug prefs`: it dumps keys.)
+SUDO=""
+if ! out=$(tailscale --socket="$SOCK" file get --conflict=rename "$real" 2>&1); then
+  if echo "$out" | grep -qiE 'access denied|permission denied|not permitted'; then
+    SUDO="sudo"; sudo tailscale --socket="$SOCK" file get --conflict=rename "$real" || true
+  else
+    echo "file get failed: $out" >&2; exit 1
+  fi
+fi
+if [ "$MODE_ARG" = "--loop" ]; then                    # idempotent background loop (checked above), not a foreground exec
+  setsid nohup $SUDO tailscale --socket="$SOCK" file get --conflict=rename --loop "$real" >>"${TMPDIR:-/tmp}/taildrop-fetch.log" 2>&1 </dev/null &
+  sleep 1; pgrep -f -- "$PAT" >/dev/null || { echo "fetch loop failed to start" >&2; exit 1; }
+  echo "fetch loop started"
+fi
+if [ -n "$SUDO" ] && [ -e "$real/$MARK" ]; then       # fix ownership only inside a marked inbox
+  sudo chown -R "$(id -un):$GROUP" "$real"; sudo chmod -R g+rwX "$real"
+fi
