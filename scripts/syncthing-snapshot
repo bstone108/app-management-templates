@@ -1,0 +1,38 @@
+#!/bin/bash
+# Usage: syncthing-snapshot <path to apps/syncthing.md>
+set -euo pipefail
+RECORD="${1:?instance record path}"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
+CONF=$(rec config_dir); DATA=$(rec db_dir); API=$(rec api_address); ROOT=$(rec durable_root)
+COLD=$(rec cold_copy_dir); COLD2=$(rec cold_copy_extra)
+ESS=$(rec cold_copy_essentials | tr -d '[],'); ESS=${ESS:-"cert.pem key.pem config.xml"}
+MARK=".app-mgmt-cold-copy"
+[ -s "$CONF/cert.pem" ] && [ -s "$CONF/key.pem" ] || { echo "live identity missing; refusing" >&2; exit 1; }
+curl -fsS -m 5 "http://$API/rest/noauth/health" | grep -q '"OK"' || { echo "not healthy; refusing" >&2; exit 1; }
+rconf=$(realpath -m "$CONF"); rdata=$(realpath -m "$DATA"); rroot=$(realpath -m "$ROOT")
+for dest in "$COLD" "$COLD2"; do                 # guard: dedicated, safe destinations only
+  [ -n "$dest" ] || { echo "cold copy dir not set; refusing" >&2; exit 1; }
+  rd=$(realpath -m "$dest")
+  case "$rd" in
+    /|"$HOME"|"$rroot"|"$rconf"|"$rconf"/*|"$rdata"|"$rdata"/*) echo "unsafe cold copy dir $rd; refusing" >&2; exit 1 ;;
+  esac
+  d=$rd; while [ "$d" != / ]; do [ -e "$d/.stfolder" ] && { echo "$rd is inside synced folder $d; refusing" >&2; exit 1; }; d=$(dirname "$d"); done
+  if [ -d "$rd/index-v2" ] || ls "$rd"/index-v2* >/dev/null 2>&1; then echo "$rd looks like a DB dir; refusing" >&2; exit 1; fi
+  if [ -d "$rd" ] && [ -n "$(ls -A "$rd")" ] && [ ! -e "$rd/$MARK" ]; then
+    echo "$rd is non-empty and not a marked cold-copy dir; refusing" >&2; exit 1
+  fi
+done
+umask 077
+for dest in "$COLD" "$COLD2"; do                 # at most two copies
+  mkdir -p "$dest"; chmod 700 "$dest"; touch "$dest/$MARK"
+  for f in $ESS; do
+    if cp -a "$CONF/$f" "$dest/.$f.tmp" && cmp -s "$CONF/$f" "$dest/.$f.tmp"; then mv -f "$dest/.$f.tmp" "$dest/$f"; fi
+  done
+  rm -f "$dest"/.*.tmp
+  chmod 600 "$dest"/*                            # cp -a keeps source modes (cert.pem is 644 live)
+  for existing in "$dest"/*; do                  # prune non-essential files only
+    [ -f "$existing" ] || continue
+    case " $ESS " in *" $(basename "$existing") "*) ;; *) rm -f -- "$existing" ;; esac
+  done
+done
+echo "snapshot done (DB not copied)" >&2
