@@ -1,0 +1,144 @@
+#!/bin/bash
+# Restore safeguards. Never deletes or overwrites existing data: things in the way are moved aside.
+# Usage: restore-guard <record> preflight          # validator + durable identity/state/DB present (re-seeds identity from cold copies only if durable is missing)
+#        restore-guard <record> link <link> <target>  # create a persistence symlink, moving anything already there aside
+#        restore-guard <record> rollback           # undo what this restore changed (journal), putting .pre-restore items back
+#        restore-guard <record> commit             # after post-verify passes: close the journal so a later rollback can't undo this restore,
+#                                                  # then prune leftovers to the limit (two per path / per app)
+#        restore-guard <record> prune              # daily check: report and prune leftovers over the limit (refuses while a restore is open)
+# Retention (storage is limited): at most the two newest <path>.pre-restore-<ts> and <path>.failed-restore-<ts> items per
+# recorded path (symlinks links, state_file, config_dir essentials), and at most two .committed-<ts> / .rolled-back-<ts>
+# journals per app. Exact names only, next to recorded paths only; never while a restore is open; never an item the
+# journal being committed references.
+# Exit: 0 ok, 2 validator REFUSE, 3 identity/state/DB missing everywhere (ask the owner), 4 existing item newer/bigger or an
+#       uncommitted journal from an earlier restore (ask the owner / commit or roll back first)
+set -euo pipefail
+RECORD="${1:?instance record path}"; ACTION="${2:?preflight|link|rollback}"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
+NAME=$(rec name); TS=$(date +%Y%m%d-%H%M%S)
+SUDO=""; [ "$(rec run_mode)" = kernel ] && SUDO=sudo   # kernel-mode state is root-owned
+JOURNAL="${RESTORE_JOURNAL:-${TMPDIR:-/tmp}/restore-${NAME:-app}.journal}"
+note() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}" >> "$JOURNAL"; }
+stop() { echo "STOP ($1): $2 -- ask the owner; nothing new was generated" >&2; exit "$1"; }
+size_of() { $SUDO du -sb -- "$1" 2>/dev/null | cut -f1; }
+newest()  { $SUDO find "$1" -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1; }
+move_aside() {  # $1 = existing item, $2 = durable counterpart (optional) to compare against
+  local p=$1 ref=${2:-}
+  if [ -d "$p" ] && [ ! -L "$p" ] && [ -z "$($SUDO find "$p" -type f -size +0 -print -quit)" ]; then
+    :   # a folder with no non-empty files (typical after a wipe): safe to move aside without comparing
+  elif [ -n "$ref" ] && [ -e "$ref" ]; then
+    if [ "$(size_of "$p")" -gt "$(size_of "$ref")" ] || [ "$(newest "$p")" -gt "$(newest "$ref")" ]; then
+      stop 4 "$p looks newer or bigger than the durable copy $ref"
+    fi
+  fi
+  while $SUDO test -e "$p.pre-restore-$TS"; do sleep 1; TS=$(date +%Y%m%d-%H%M%S); done
+  local aside="$p.pre-restore-$TS"
+  $SUDO mv -- "$p" "$aside"; note moved "$p" "$aside"; echo "moved aside: $p -> $aside" >&2
+}
+place_copy() {  # re-seed one identity file from a cold copy
+  local src=$1 dst=$2
+  if $SUDO test -e "$dst" || [ -L "$dst" ]; then move_aside "$dst"; fi
+  $SUDO mkdir -p "$(dirname "$dst")"; $SUDO cp -p -- "$src" "$dst"; $SUDO chmod 600 "$dst"; note placed "$dst"
+  echo "re-seeded $dst from cold copy" >&2
+}
+cold_file() {  # first non-empty cold copy of a file name
+  local f=$1 d
+  for d in "$(rec cold_copy_dir)" "$(rec cold_copy_extra)"; do
+    [ -n "$d" ] || continue
+    [ -s "$d/$f" ] && { echo "$d/$f"; return 0; }
+    [ -s "$d/$f.prev" ] && { echo "$d/$f.prev"; return 0; }
+  done; return 1
+}
+KEEP=(); LIVE=()
+exact() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|/]/\\&/g'; }   # regex-escape a literal name
+keep_two() {  # $1 dir, $2 exact regex of backup names; keeps the two newest (timestamp order), removes the rest
+  local dir=$1 re=$2 f
+  $SUDO test -d "$dir" || return 0
+  $SUDO find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | { grep -E "^$re\$" || true; } | sort -r | tail -n +3 |
+  while read -r f; do
+    c=$($SUDO readlink -f -- "$dir/$f")
+    for t in "${LIVE[@]}"; do case "$t/" in "$c"/*) echo "kept (in use: $t)" >&2; continue 2;; esac; done   # never prune what a recorded path or symlink points at
+    if printf '%s\n' "${KEEP[@]}" | grep -qxF -- "$dir/$f"; then echo "kept (referenced by the committed journal): $dir/$f" >&2; continue; fi
+    echo "over the limit of two, removing: $dir/$f" >&2; $SUDO rm -rf -- "${dir:?}/$f"
+  done
+}
+recorded_paths() {  # the app's recorded paths only
+  rec symlinks | tr -d '[]' | tr ',' '\n' | sed -n 's/^[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*->.*/\1/p'
+  local sf conf f; sf=$(rec state_file); conf=$(rec config_dir)
+  [ -n "$sf" ] && echo "$sf"
+  if [ -n "$conf" ]; then for f in $(rec cold_copy_essentials | tr -d '[],'); do echo "$conf/$f"; done; fi
+}
+live_targets() {  # what is in use: targets of every recorded path, and of every symlink next to those paths
+  local p d l
+  while read -r p; do
+    [ -n "$p" ] || continue
+    $SUDO test -e "$p" && $SUDO readlink -f -- "$p"
+    d=$(dirname "$p")
+    while read -r l; do [ -n "$l" ] && $SUDO readlink -f -- "$l" 2>/dev/null || true; done < <($SUDO find "$d" -mindepth 1 -maxdepth 1 -type l 2>/dev/null)
+  done < <(recorded_paths)
+}
+do_prune() {
+  local p kind
+  mapfile -t LIVE < <(live_targets | sort -u)
+  while read -r p; do
+    [ -n "$p" ] || continue
+    for kind in pre-restore failed-restore; do
+      keep_two "$(dirname "$p")" "$(exact "$(basename "$p")")\.$kind-[0-9]{8}-[0-9]{6}"
+    done
+  done < <(recorded_paths)
+  for kind in committed rolled-back; do
+    keep_two "$(dirname "$JOURNAL")" "$(exact "$(basename "$JOURNAL")")\.$kind-[0-9]{8}-[0-9]{6}"
+  done
+}
+case "$ACTION" in
+preflight)
+  [ -f "$JOURNAL" ] && { echo "STOP (4): uncommitted journal $JOURNAL from an earlier restore; commit it (if that restore was verified) or roll it back first" >&2; exit 4; }
+  if [ -n "${VALIDATOR:-}" ] && [ -n "${APP_DIR:-}" ]; then
+    out=$("$VALIDATOR" "$APP_DIR" 2>&1) || true
+    if echo "$out" | grep -E "^REFUSE +(${NAME}|registry|synced) " >/dev/null; then echo "$out" | grep '^REFUSE' >&2; exit 2; fi
+  fi
+  SF=$(rec state_file); CONF=$(rec config_dir); DB=$(rec db_dir)
+  if [ -n "$SF" ] && ! $SUDO test -s "$SF"; then            # durable first, cold copy second
+    c=$(cold_file "$(basename "$SF")") || stop 3 "state file $SF is missing/empty and no cold copy exists"
+    place_copy "$c" "$SF"
+  fi
+  if [ -n "$CONF" ]; then
+    ESS=$(rec cold_copy_essentials | tr -d '[],'); ESS=${ESS:-"cert.pem key.pem"}
+    for f in $ESS; do                                   # identity/config essentials, e.g. cert.pem key.pem config.xml
+      [ -s "$CONF/$f" ] && continue
+      c=$(cold_file "$f") || stop 3 "identity $CONF/$f is missing and no cold copy exists"
+      place_copy "$c" "$CONF/$f"
+    done
+  fi
+  if [ -n "$DB" ] && { [ ! -d "$DB" ] || [ -z "$(ls -A "$DB" 2>/dev/null)" ]; }; then
+    stop 3 "database dir $DB is missing or empty; starting would build a fresh DB (full re-index)"
+  fi
+  echo "preflight OK: durable identity/state present" >&2 ;;
+link)
+  L="${3:?link path}"; T="${4:?durable target}"
+  [ -e "$T" ] || stop 3 "durable target $T does not exist"
+  if [ -L "$L" ] && [ "$(readlink -f "$L")" = "$(readlink -f "$T")" ]; then echo "link already correct: $L" >&2; exit 0; fi
+  if [ -e "$L" ] || [ -L "$L" ]; then move_aside "$L" "$T"; fi
+  mkdir -p "$(dirname "$L")"; ln -s -- "$T" "$L"; note linked "$L"; echo "linked $L -> $T" >&2 ;;
+rollback)
+  [ -f "$JOURNAL" ] || { echo "nothing to roll back" >&2; exit 0; }
+  tac "$JOURNAL" | while IFS=$'\t' read -r kind a b; do
+    case $kind in
+      linked) [ -L "$a" ] && rm -f -- "$a" || true ;;                       # only the symlink this restore made
+      placed) $SUDO test -f "$a" && $SUDO mv -- "$a" "$a.failed-restore-$TS" || true ;;   # keep even our own copy, just out of the way
+      moved)  $SUDO test -e "$b" && ! $SUDO test -e "$a" && $SUDO mv -- "$b" "$a" || true ;;
+    esac
+  done
+  mv -- "$JOURNAL" "$JOURNAL.rolled-back-$TS"; echo "rolled back" >&2 ;;
+commit)
+  if [ -f "$JOURNAL" ]; then
+    mapfile -t KEEP < <(awk -F'\t' '$1=="moved"{print $3}' "$JOURNAL")
+    mv -- "$JOURNAL" "$JOURNAL.committed-$TS"
+  fi
+  echo committed >&2
+  do_prune ;;
+prune)
+  [ -f "$JOURNAL" ] && { echo "a restore is open (uncommitted journal $JOURNAL); not pruning" >&2; exit 4; }
+  do_prune; echo "prune done" >&2 ;;
+*) echo "unknown action" >&2; exit 1 ;;
+esac
