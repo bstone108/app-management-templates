@@ -1,12 +1,58 @@
 #!/bin/bash
 # Usage: syncthing-launcher <path to apps/syncthing.md>
+# Starts Syncthing fully detached (own session and process group) and returns:
+#   exit 0 = healthy, 1 = not healthy (or binary missing), 2 = usage error (nothing started).
+# Idempotent: exits 0 at once when the local health endpoint says OK. Never run it to "inspect" it; read the file.
+# Manages only Syncthing: it never starts, stops, or chains another app.
 set -euo pipefail
-RECORD="${1:?instance record path}"
+usage() { echo "usage: syncthing-launcher <path to apps/syncthing.md>   (no other arguments; starts nothing otherwise)" >&2; exit 2; }
+{ [ "$#" -eq 1 ] && [ -f "$1" ]; } || usage
+RECORD="$1"
 rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
 BIN=$(rec binary_path); CONF=$(rec config_dir); DATA=$(rec db_dir); API=$(rec api_address)
 LOG=$(rec log_path); COLD=$(rec cold_copy_dir); COLD2=$(rec cold_copy_extra); MEM=$(rec memory_limit)
+[ -n "$BIN" ] && [ -n "$CONF" ] && [ -n "$DATA" ] && [ -n "$API" ] || { echo "record lacks binary_path/config_dir/db_dir/api_address" >&2; exit 1; }
+OUT="${LOG:+$LOG.out}"; OUT="${OUT:-${TMPDIR:-/tmp}/syncthing-launcher.out}"   # daemon stdout/stderr (the log itself stays --log-file)
+LOCK="${TMPDIR:-/tmp}/syncthing-launcher.lock"
+
+healthy() {   # unauthenticated health endpoint on the local API address; no key needed
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 2 "http://$API/rest/noauth/health" 2>/dev/null | grep -q '"OK"'
+  else
+    python3 -c 'import sys,urllib.request; sys.exit(0 if b"OK" in urllib.request.urlopen(sys.argv[1], timeout=2).read() else 1)' \
+      "http://$API/rest/noauth/health" >/dev/null 2>&1
+  fi
+}
+wait_healthy() {   # $1 seconds; $2 optional pid that must stay alive
+  local i
+  for ((i = 0; i < $1 * 2; i++)); do
+    healthy && return 0
+    if [ -n "${2:-}" ] && ! kill -0 "$2" 2>/dev/null; then return 1; fi
+    sleep 0.5
+  done
+  healthy
+}
+running_pid() {   # a real Syncthing process serving this config (matched by process name, not any shell's command line)
+  local p name; name=$(basename "$BIN" | cut -c1-15)
+  for p in $(pgrep -u "$(id -u)" -x "$name" 2>/dev/null || true); do
+    tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -qF -- " serve --config=$CONF " && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 [ -x "$BIN" ] || { echo "binary missing at $BIN: restore from binary_backups or a verified GitHub download" >&2; exit 1; }
 mkdir -p "$CONF" "$DATA"; chmod 700 "$CONF" "$DATA"
+
+if healthy; then echo "syncthing already healthy" >&2; exit 0; fi
+exec 9>"$LOCK"                                   # one start at a time; fd 9 is closed before the daemon starts
+flock -w 20 9 || echo "another start is still running; checking health anyway" >&2
+if healthy; then echo "syncthing already healthy" >&2; exit 0; fi
+if running_pid >/dev/null; then                  # still starting: wait, never launch a second instance
+  echo "syncthing process exists but is not healthy yet; waiting" >&2
+  wait_healthy 20 && exit 0
+  echo "syncthing process exists but is not healthy after 20s" >&2; exit 1
+fi
+
 if [ ! -s "$CONF/cert.pem" ] || [ ! -s "$CONF/key.pem" ]; then       # re-seed identity only
   for src in "$COLD" "$COLD2"; do
     if [ -n "$src" ] && [ -s "$src/cert.pem" ] && [ -s "$src/key.pem" ]; then
@@ -20,5 +66,20 @@ fi
 export STNOUPGRADE=1
 if [ -n "$MEM" ]; then export GOMEMLIMIT="$MEM" GOMAXPROCS="${GOMAXPROCS:-1}" GOGC="${GOGC:-40}"; fi
 LOGARG=(); [ -n "$LOG" ] && LOGARG=(--log-file="$LOG")
-exec nice -n 19 "$BIN" serve --config="$CONF" --data="$DATA" \
-  --no-browser --no-upgrade --gui-address="$API" "${LOGARG[@]}"
+
+# Fully detached: own session (setsid), immune to SIGHUP (nohup), stdin from /dev/null, no inherited fds,
+# so the shell or tool call that ran this can exit or be aborted without stopping Syncthing.
+# Syncthing's monitor process stays on (no --no-restart) and restarts the child after a crash.
+(
+  for fd in /proc/self/fd/*; do
+    n=${fd##*/}
+    case "$n" in 0|1|2) ;; *) eval "exec $n>&-" 2>/dev/null || true ;; esac
+  done
+  exec setsid nohup nice -n 19 "$BIN" serve --config="$CONF" --data="$DATA" \
+    --no-browser --no-upgrade --gui-address="$API" "${LOGARG[@]}" </dev/null >>"$OUT" 2>&1
+) &
+PID=$!
+exec 9>&-
+if wait_healthy 20 "$PID"; then echo "syncthing started (pid $PID) and healthy" >&2; exit 0; fi
+echo "syncthing not healthy within 20s (pid $PID); see $OUT${LOG:+ and $LOG}" >&2
+exit 1
