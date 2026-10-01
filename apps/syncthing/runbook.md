@@ -39,10 +39,14 @@ Optional cold copy (`cold_copy_essentials`): `cert.pem`, `key.pem`, `config.xml`
 
 ## Launcher contract
 It installs nothing and upgrades nothing. It re-seeds identity only if it is missing, never touches the DB, runs with `--no-upgrade`, and takes `api_address` from the record.
+- **Detach and return.** The launcher detaches the daemon itself (its own session and process group, stdin from `/dev/null`, output appended to a log, no inherited file descriptors), waits briefly for health, and returns. Never run the daemon in the foreground of a tool call or shell: when that call ends or is aborted, its process group is signalled and the app stops.
+- **Never run a launcher to inspect it.** Do not call it with flags such as `--help`; read the file instead. Launchers reject unknown arguments without starting anything.
+- **Launchers are independent.** Each app's launcher manages only its own app; never start, stop, or chain another app from it. Cross-app recovery belongs to the daily check.
+- It exits 0 at once when the local health endpoint is OK, takes one start at a time (lock), waits instead of launching a second instance while one is still starting, and after a detached launch waits up to about 20 seconds for health (exit 0 healthy, 1 not). Syncthing's own monitor stays on (no `--no-restart`).
 
 ## Reference start launcher (bash skeleton; reads the instance record)
 > **Script:** [`scripts/syncthing-launcher`](../../scripts/syncthing-launcher) (sha256 listed in `index.json`). Fetch it at a pinned commit, verify the checksum, and review it before use.
-Run it detached (`nohup <launcher> <record> >/dev/null 2>&1 &`). Two processes (monitor + child) is normal.
+Run it as a plain call (`<launcher> <record>`); it detaches itself and returns (see Launcher contract). Two processes (monitor + child) is normal.
 
 ## Reference snapshot helper (cold copy; essentials only, max two)
 > **Script:** [`scripts/syncthing-snapshot`](../../scripts/syncthing-snapshot) (sha256 listed in `index.json`). Fetch it at a pinned commit, verify the checksum, and review it before use.
