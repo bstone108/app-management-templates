@@ -51,8 +51,8 @@
     },
     {
       "path": "scripts/syncthing-launcher",
-      "purpose": "Syncthing start launcher: installs/upgrades nothing, re-seeds identity only if missing, never touches the DB, runs with --no-upgrade and optional memory caps.",
-      "sha256": "bf362252c20c80282ec281894f4eca2408870dd127b5fe265334d6421cc62b26"
+      "purpose": "Syncthing start launcher: refuses unknown arguments, exits 0 at once when healthy, starts fully detached (setsid nohup, own session, inherited fds closed) and waits for health; installs/upgrades nothing, re-seeds identity only if missing, never touches the DB, runs with --no-upgrade and optional memory caps; keeps Syncthing's monitor; manages only Syncthing.",
+      "sha256": "e8ec75b13ad90128c0dceba222405f0a75adfc1c6c859e8ec9270a2eecea6d3e"
     },
     {
       "path": "scripts/syncthing-snapshot",
@@ -71,8 +71,8 @@
     },
     {
       "path": "scripts/tailscale-launcher",
-      "purpose": "Tailscale launcher: installs only if missing (never upgrades), re-seeds state from cold copy, starts tailscaled, treats NeedsLogin as a failed restore, refreshes the cold copy when healthy.",
-      "sha256": "7c55be95334af1d9547007e4fd6e7b3e1c4c903c5a3454e3082ac1ed4450b307"
+      "purpose": "Tailscale launcher: refuses unknown arguments, installs only if missing (never upgrades), re-seeds state from cold copy, starts tailscaled detached (own session), treats NeedsLogin as a failed restore, refreshes the cold copy when healthy; manages only Tailscale.",
+      "sha256": "b5f9459cfdd99a6ced924ab7013458e0c7930a5ba3bda5636fd3c6bfcca85663"
     }
   ]
 }
