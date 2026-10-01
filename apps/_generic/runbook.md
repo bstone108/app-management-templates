@@ -59,6 +59,7 @@ This runbook has no installation-specific values. Every `field_name` below comes
 | `owner_confirmed_risks` | risks the owner explicitly accepted after a sanity-check warning: list of `{risk: <finding id>, date, owner_said}`. REFUSE-level findings can never be listed here |
 | `upgrade_command` / `upgrade_also` / `rollback` | optional override of the runbook's upgrade, extra companion packages upgraded in the same step, and rollback notes |
 | `runbook_skill` | the app-specific runbook template to follow |
+| `template_commit` | the template repo commit this app's runbook and scripts were fetched from (pinned, never a branch); compare with `index.json` at the repo head to spot newer versions |
 
 ## Registry schema
 `registry.json` holds the global fields `durable_root`, `app_dir`, `launcher_backup_dir`, `daily_check_time`, `report_policy` (default `silent-when-healthy`), `validator_path` (the installed sanity-check validator, kept in `launcher_backup_dir`), `restore_guard_path` (the installed restore safeguards script from section 8, kept in `launcher_backup_dir`), and `ignored_services` (services/binaries already proposed to the owner and declined or deferred: `{name, path, decision, date}`; never re-proposed), plus one row per app with: `name`, `config_record`, `runbook_skill`, `install_method`, `start_command`, `self_serve_start`, `depends_on`, `consumers`, `installed_version`, `pinned_version`, `latest_version_seen`, and optionally `major_upgrade_offered`, `upgrade_held`, `last_upgrade_review` (mirrors of the record fields).
@@ -142,6 +143,9 @@ For each entry in `symlinks`: use `restore-guard <record> link <link> <target>` 
 - If the record has `self_serve_start: true`, any bot may run `start_command`. Otherwise, bots notify App Management and App Management runs it.
 - `start_command` must be idempotent (running it while the app is healthy breaks nothing) and must **never upgrade**. It installs only if missing.
 - Let it finish. Run long starts in the background and wait. An interrupted start can leave the app down.
+- **Detach and return.** The launcher detaches the daemon itself (its own session and process group, stdin from `/dev/null`, output appended to a log, no inherited file descriptors), waits briefly for health, and returns. Never run the daemon in the foreground of a tool call or shell: when that call ends or is aborted, its process group is signalled and the app stops.
+- **Never run a launcher to inspect it.** Do not call it with flags such as `--help`; read the file instead. Launchers reject unknown arguments without starting anything.
+- **Launchers are independent.** Each app's launcher manages only its own app; never start, stop, or chain another app from it. Cross-app recovery belongs to the daily check.
 
 ## 6. Health check
 Use the standard check in the app's runbook skill, or `health_command`/`health_expected` if the record overrides it. Also check that the process exists and the ports/sockets are present.
