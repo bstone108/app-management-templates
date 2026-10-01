@@ -32,6 +32,9 @@ Run `app-management-sanity-check` before changing `state_dir`, `cold_copy_dir`, 
 
 ## Launcher contract
 Install **only if missing** (at `pinned_version` plus `apt-mark hold tailscale` when pinned). **Never upgrade**: upgrades happen only in the daily check's Update step. Restore `state_file` from the cold copy if it is missing or tiny. Start, wait for the socket, and treat NeedsLogin as a failed restore (cold restore and restart, and keep the node up while escalating). Set the hostname and refresh the cold copy.
+- **Detach and return.** The launcher detaches the daemon itself (its own session and process group, stdin from `/dev/null`, output appended to a log, no inherited file descriptors), waits briefly for health, and returns. Never run the daemon in the foreground of a tool call or shell: when that call ends or is aborted, its process group is signalled and the app stops.
+- **Never run a launcher to inspect it.** Do not call it with flags such as `--help`; read the file instead. Launchers reject unknown arguments without starting anything.
+- **Launchers are independent.** Each app's launcher manages only its own app; never start, stop, or chain another app from it. Cross-app recovery belongs to the daily check.
 
 ## Reference launcher (bash skeleton; reads the instance record)
 > **Script:** [`scripts/tailscale-launcher`](../../scripts/tailscale-launcher) (sha256 listed in `index.json`). Fetch it at a pinned commit, verify the checksum, and review it before use.
