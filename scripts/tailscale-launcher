@@ -1,7 +1,10 @@
 #!/bin/bash
 # Usage: tailscale-launcher <path to apps/tailscale.md>
 set -euo pipefail
-RECORD="${1:?instance record path}"
+# Manages only Tailscale: it never starts, stops, or chains another app. Never run it to "inspect" it; read the file.
+usage() { echo "usage: tailscale-launcher <path to apps/tailscale.md>   (no other arguments; starts nothing otherwise)" >&2; exit 2; }
+{ [ "$#" -eq 1 ] && [ -f "$1" ]; } || usage
+RECORD="$1"
 rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
 STATE_DIR=$(rec state_dir); SOCK=$(rec socket_path); LOG=$(rec log_path)
 COLD=$(rec cold_copy_dir); NODE=$(rec node_name); MODE=$(rec run_mode); PIN=$(rec pinned_version)
@@ -46,7 +49,10 @@ cap_log() {
 
 start_daemon() {
   $SUDO mkdir -p "$STATE_DIR" "$(dirname "$SOCK")"; $SUDO chmod 700 "$STATE_DIR"; $SUDO rm -f "$SOCK"
-  $SUDO sh -c "nohup '$TSD' --statedir='$STATE_DIR' --socket='$SOCK' --tun='$TUN' >>'$LOG' 2>&1 &"
+  # Detached: own session (setsid), stdin from /dev/null, output to the log, no inherited fds,
+  # so a shell or tool call that ran this launcher can end or be aborted without stopping tailscaled.
+  ( for fd in /proc/self/fd/*; do n=${fd##*/}; case "$n" in 0|1|2) ;; *) eval "exec $n>&-" 2>/dev/null || true ;; esac; done
+    exec $SUDO sh -c "setsid nohup '$TSD' --statedir='$STATE_DIR' --socket='$SOCK' --tun='$TUN' </dev/null >>'$LOG' 2>&1 &" )
   for _ in $(seq 1 40); do $SUDO test -S "$SOCK" && return 0; sleep 0.25; done
   echo "socket did not appear; see $LOG" >&2; return 1
 }
