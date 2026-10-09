@@ -51,8 +51,8 @@
     },
     {
       "path": "scripts/syncthing-launcher",
-      "purpose": "Syncthing start launcher: refuses unknown arguments, exits 0 at once when healthy, starts fully detached (setsid nohup, own session, inherited fds closed) and waits for health; installs/upgrades nothing, re-seeds identity only if missing, never touches the DB, runs with --no-upgrade and optional memory caps; keeps Syncthing's monitor; manages only Syncthing.",
-      "sha256": "e8ec75b13ad90128c0dceba222405f0a75adfc1c6c859e8ec9270a2eecea6d3e"
+      "purpose": "Syncthing start launcher: refuses unknown arguments, exits 0 at once when healthy, starts fully detached (setsid nohup, own session, inherited fds closed) and waits for health; installs/upgrades nothing, re-seeds identity only if missing, never touches the DB, runs with --no-upgrade and optional memory caps; keeps Syncthing's monitor; manages only Syncthing. Rollback guard: only when the DB is older than the kernel boot (and an optional platform boot marker agrees), starts sendreceive folders receiveonly and a detached worker reverts stale changes, keeps post-boot edits as conflict copies, restores the folder types; leaves receiveonly plus a flag if it can't finish; keeps at most two run dirs.",
+      "sha256": "39885d96a981802ece08c9ca0ee4c22c6a8149a09b2d888ec3ddfd6aa9b7f733"
     },
     {
       "path": "scripts/syncthing-snapshot",

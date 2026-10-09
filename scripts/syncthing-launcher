@@ -4,7 +4,204 @@
 #   exit 0 = healthy, 1 = not healthy (or binary missing), 2 = usage error (nothing started).
 # Idempotent: exits 0 at once when the local health endpoint says OK. Never run it to "inspect" it; read the file.
 # Manages only Syncthing: it never starts, stops, or chains another app.
+# Rollback guard (only when the machine came back from an older whole-disk snapshot; normal starts are unchanged):
+# every sendreceive folder starts receiveonly, a detached worker reverts the stale local changes once a peer's index
+# is in, keeps post-boot local edits as sync-conflict copies, restores the folder types, and clears the flag. If it
+# can't finish, folders stay receiveonly (safe) and the flag says why. Optional record keys:
+#   rollback_guard: false            disable the guard
+#   rollback_guard_dir: <dir>        flag, log and run dirs (default: <app_dir>/rollback-guard, else next to the record)
+#   boot_marker: <file>              platform file rewritten on every normal boot (env SYNCTHING_BOOT_MARKER overrides);
+#                                    if unset, detection uses the DB age alone (more false positives, which are safe)
+#   rollback_guard_gap_s: 600        rollback_guard_timeout_s: 3600
+# At most two run dirs are kept (pruned at the end of every run; the running one is never deleted).
 set -euo pipefail
+STG_GAP_S=600; STG_TIMEOUT_S=3600
+stg_newest_mtime() {  # newest file mtime (epoch s) under $1, empty if none
+  find "$1" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1
+}
+# rollback_detect <db_dir> <boot_epoch> [boot marker]  -> 0 + reason on stdout if rollback, else 1
+# A snapshot restore takes back everything on the machine, so the test compares the restored disk with the one thing
+# it can't take back: the kernel boot time. Syncthing writes its SQLite DB (WAL) while running, so after a process
+# restart the DB is newer than boot; after a rollback its newest mtime is the snapshot time (long before boot).
+# Optional boot marker: a file the platform writes on every normal boot after restoring/hydrating storage. If set, a
+# marker newer than boot means "normal boot" (no rollback); older or absent means rollback. If not set, DB age alone.
+rollback_detect() {
+  local db="$1" boot="$2" marker="${3:-}" newest m
+  [ -d "$db/index-v2" ] || return 1                 # no DB: not a rollback (reseed/full-index path warns)
+  newest=$(stg_newest_mtime "$db/index-v2")
+  [ -n "$newest" ] || return 1
+  [ "$newest" -lt $((boot - STG_GAP_S)) ] || return 1
+  if [ -z "$marker" ]; then                         # no platform marker configured: DB age alone (fail-safe)
+    echo "db_newest=$newest boot=$boot gap_s=$((boot - newest)) boot_marker=not-configured"; return 0
+  fi
+  if [ -e "$marker" ]; then
+    m=$(stat -c %Y "$marker" 2>/dev/null || echo 0)
+    [ "$m" -lt "$boot" ] || return 1               # marker rewritten this boot: normal boot
+    echo "db_newest=$newest boot=$boot gap_s=$((boot - newest)) boot_marker_mtime=$m (pre-boot)"
+  else
+    echo "db_newest=$newest boot=$boot gap_s=$((boot - newest)) boot_marker=absent"
+  fi
+  return 0
+}
+
+# stg_set_receiveonly <config.xml> <out ids file>: every top-level folder with type="sendreceive" -> receiveonly.
+# Text edit of only those opening tags (no reserialization); the <defaults> folder template is untouched.
+stg_set_receiveonly() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys, os, xml.etree.ElementTree as ET
+cfg, out = sys.argv[1], sys.argv[2]
+root = ET.parse(cfg).getroot()
+ids = [f.get("id") for f in root.findall("folder") if f.get("id") and f.get("type") == "sendreceive"]
+txt = open(cfg, encoding="utf-8").read()
+for fid in ids:
+    pat = re.compile(r'(<folder\s[^>]*\bid="%s"[^>]*\btype=")sendreceive(")' % re.escape(fid))
+    txt, n = pat.subn(r'\1receiveonly\2', txt, count=1)
+    if n != 1: sys.exit("could not edit folder %s" % fid)
+tmp = cfg + ".stg-tmp"
+with open(tmp, "w", encoding="utf-8") as fh: fh.write(txt)
+os.chmod(tmp, 0o600); os.replace(tmp, cfg)
+root2 = ET.parse(cfg).getroot()
+bad = [f.get("id") for f in root2.findall("folder") if f.get("id") in ids and f.get("type") != "receiveonly"]
+if bad: sys.exit("verify failed: %s" % bad)
+open(out, "w").write("".join(i + "\n" for i in ids))
+PY
+}
+
+stg_flag() {  # stg_flag <status> <message...>
+  local st="$1"; shift
+  mkdir -p "$(dirname "$STG_FLAG")"
+  { echo "status: $st"; echo "time: $(date '+%F %T %Z')"; echo "message: $*"
+    echo "run_dir: ${STG_RUN:-}"; echo "folders_switched_to_receiveonly: $(tr '\n' ' ' <"${STG_RUN:-/nonexistent}/folders.txt" 2>/dev/null)"
+    echo "worker_pid: ${STG_WORKER_PID:-}"
+    echo "action: if status is in-progress and worker_pid is alive and time < 60 min ago, wait. Otherwise see the Syncthing runbook, 'Rollback guard'."
+  } >"$STG_FLAG.tmp" && mv -f "$STG_FLAG.tmp" "$STG_FLAG"
+}
+stg_log() { mkdir -p "$(dirname "$STG_LOG")"; echo "$(date '+%F %T %Z') [$$] $*" >>"$STG_LOG"; }
+
+# ---- worker (runs detached; uses the API) ----
+stg_api() {  # stg_api <method> <path> [json body]
+  local m="$1" p="$2"
+  if [ $# -ge 3 ]; then
+    curl -fsS -m 30 -X "$m" -H @"$STG_RUN/.hdr" -H 'Content-Type: application/json' --data "$3" "http://$STG_API$p"
+  else
+    curl -fsS -m 30 -X "$m" -H @"$STG_RUN/.hdr" "http://$STG_API$p"
+  fi
+}
+stg_left() { echo $((STG_DEADLINE - $(date +%s))); }
+# stg_prune_runs <current run dir>: keep at most two run dirs (backups) — the current one plus the newest other;
+# never deletes the current run or any run whose worker still holds its lock (in progress).
+stg_prune_runs() {
+  local cur="$1" parent d n=0
+  parent=$(dirname "$cur")
+  for d in $(find "$parent" -mindepth 1 -maxdepth 1 -type d -name 'syncthing-rollback-[0-9]*' 2>/dev/null | sort -r); do
+    [ "$d" = "$cur" ] && continue
+    n=$((n + 1)); [ "$n" -le 1 ] && continue
+    if [ -e "$d/.worker.lock" ] && ! flock -n "$d/.worker.lock" true 2>/dev/null; then continue; fi
+    case "$d" in "$parent"/syncthing-rollback-[0-9]*) rm -rf -- "$d" && stg_log "pruned old run dir $d (keep 2)";; esac
+  done
+}
+stg_fail() {  # leaves folders receiveonly (safe), keeps Syncthing running, flags
+  stg_log "FAILED: $* — folders left receiveonly (safe). Flag: $STG_FLAG"
+  STG_WORKER_PID=$$ stg_flag failed "$*"
+  rm -f "$STG_RUN/.hdr"; stg_prune_runs "$STG_RUN"; exit 1
+}
+# folder ready = idle, >=1 connected sharing peer whose index for this folder is in (remoteState valid);
+# with $2=after-revert also nothing needed and no receive-only changes. Must hold on 3 polls in a row.
+stg_folder_ready() {
+  local fid="$1" phase="$2" st conns peers d ok=0
+  st=$(stg_api GET "/rest/db/status?folder=$fid") || return 1
+  [ "$(jq -r .state <<<"$st")" = idle ] || return 1
+  if [ "$phase" = after-revert ]; then
+    [ "$(jq -r .needTotalItems <<<"$st")" = 0 ] || return 1
+    [ "$(jq -r .receiveOnlyTotalItems <<<"$st")" = 0 ] || return 1
+  fi
+  conns=$(stg_api GET /rest/system/connections) || return 1
+  peers=$(stg_api GET "/rest/config/folders/$fid" | jq -r --arg me "$STG_MYID" '.devices[].deviceID | select(. != $me)') || return 1
+  for d in $peers; do
+    [ "$(jq -r --arg d "$d" '.connections[$d].connected // false' <<<"$conns")" = true ] || continue
+    [ "$(stg_api GET "/rest/db/completion?folder=$fid&device=$d" | jq -r .remoteState)" = valid ] && ok=1
+  done
+  [ "$ok" = 1 ]
+}
+stg_wait_ready() {  # stg_wait_ready <fid> <phase>
+  local n=0
+  while [ "$(stg_left)" -gt 0 ]; do
+    if stg_folder_ready "$1" "$2"; then n=$((n + 1)); [ $n -ge 3 ] && return 0; else n=0; fi
+    sleep 5
+  done
+  return 1
+}
+stg_conflict_name() {  # <relpath> <epoch> <short id> -> Syncthing-style conflict name
+  local rel="$1" dir base stem ext ts
+  ts=$(date -d "@$2" +%Y%m%d-%H%M%S)
+  dir=$(dirname "$rel"); base=$(basename "$rel")
+  if [[ "$base" == ?*.* ]]; then stem=${base%.*}; ext=".${base##*.}"; else stem=$base; ext=""; fi
+  [ "$dir" = . ] && dir="" || dir="$dir/"
+  echo "${dir}${stem}.sync-conflict-${ts}-$3${ext}"
+}
+rollback_worker() {  # rollback_worker <run dir> <api address> <config.xml> <boot epoch: everything older is snapshot content>
+  set -uo pipefail
+  STG_RUN="$1"; STG_API="$2"; local cfg="$3" snap="$4" fid fpath lc kept saved rel src dst cname i
+  STG_DEADLINE=$(( $(date +%s) + STG_TIMEOUT_S ))
+  exec 8>"$STG_RUN/.worker.lock"; flock -n 8 || { stg_log "worker already running for $STG_RUN"; exit 0; }
+  STG_WORKER_PID=$$ stg_flag in-progress "rollback detected; recovery worker running"
+  stg_log "worker start pid $$ run=$STG_RUN boot=$snap ($(date -d "@$snap" '+%F %T %Z'))"
+  ( umask 077; printf 'X-API-Key: %s\n' "$(sed -n 's:.*<apikey>\(.*\)</apikey>.*:\1:p' "$cfg" | head -1)" >"$STG_RUN/.hdr" )
+  for i in $(seq 1 240); do stg_api GET /rest/system/status >/dev/null 2>&1 && break; sleep 0.5; done
+  STG_MYID=$(stg_api GET /rest/system/status | jq -r .myID) || stg_fail "API not reachable"
+  [ -n "$STG_MYID" ] && [ "$STG_MYID" != null ] || stg_fail "no myID from API"
+  stg_log "API up, myID ${STG_MYID:0:7}"
+  while read -r fid; do
+    [ -n "$fid" ] || continue
+    [ "$(stg_api GET "/rest/config/folders/$fid" | jq -r .type)" = receiveonly ] || stg_fail "$fid is not receiveonly at worker start"
+    fpath=$(stg_api GET "/rest/config/folders/$fid" | jq -r .path)
+    stg_log "$fid: waiting for a connected peer's index + idle (budget $(stg_left)s)"
+    stg_wait_ready "$fid" before-revert || stg_fail "$fid: no peer index / not idle before timeout"
+    lc=$(stg_api GET "/rest/db/localchanged?folder=$fid&perpage=1000000") || stg_fail "$fid: localchanged failed"
+    jq -r '.files[] | [(.deleted|tostring), .type, .name] | @tsv' <<<"$lc" >"$STG_RUN/$fid.localchanged.tsv"
+    stg_log "$fid: $(wc -l <"$STG_RUN/$fid.localchanged.tsv") receive-only local changes (stale snapshot versions + any post-snapshot edits)"
+    kept=0; saved=0; : >"$STG_RUN/$fid.kept.txt"
+    while IFS=$'\t' read -r del typ rel; do
+      [ "$del" = false ] || continue
+      case "$typ" in *FILE|file|0) ;; *) continue ;; esac
+      src="$fpath/$rel"
+      [ -f "$src" ] || continue
+      mkdir -p "$STG_RUN/keep/$fid/$(dirname "$rel")"          # every changed file is saved (nothing is lost) ...
+      cp -a -- "$src" "$STG_RUN/keep/$fid/$rel" || stg_fail "$fid: could not save $rel"; saved=$((saved + 1))
+      [ "$(stat -c %Y "$src")" -ge "$snap" ] || continue      # ... only edits made after this boot go back as conflict copies
+      printf '%s\n' "$rel" >>"$STG_RUN/$fid.kept.txt"; kept=$((kept + 1))
+    done <"$STG_RUN/$fid.localchanged.tsv"
+    stg_log "$fid: saved $saved changed file(s) to $STG_RUN/keep; $kept edited after boot will be re-added as conflict copies"
+    stg_api POST "/rest/db/revert?folder=$fid" >/dev/null || stg_fail "$fid: revert failed"
+    stg_log "$fid: revert requested"
+    sleep 3
+    stg_wait_ready "$fid" after-revert || stg_fail "$fid: not clean after revert (receive-only changes or need > 0) before timeout"
+    stg_api PATCH "/rest/config/folders/$fid" '{"type":"sendreceive"}' >/dev/null || stg_fail "$fid: could not set sendreceive"
+    [ "$(stg_api GET "/rest/config/folders/$fid" | jq -r .type)" = sendreceive ] || stg_fail "$fid: type not sendreceive after PATCH"
+    sed -i "/^$fid\$/d" "$STG_RUN/folders.txt"
+    stg_log "$fid: clean after revert; type restored to sendreceive"
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      src="$STG_RUN/keep/$fid/$rel"; dst="$fpath/$rel"
+      if [ ! -e "$dst" ]; then
+        mkdir -p "$(dirname "$dst")"; cp -a -- "$src" "$dst" && stg_log "$fid: re-added new local file $rel"
+      elif cmp -s "$src" "$dst"; then
+        stg_log "$fid: $rel identical to synced version, nothing to keep"
+      else
+        cname=$(stg_conflict_name "$rel" "$(stat -c %Y "$src")" "${STG_MYID:0:7}")
+        cp -a -- "$src" "$fpath/$cname" && stg_log "$fid: kept local edit of $rel as $cname"
+      fi
+    done <"$STG_RUN/$fid.kept.txt"
+  done <<<"$(cat "$STG_RUN/folders.txt")"
+  rm -f "$STG_RUN/.hdr" "$STG_FLAG"
+  stg_log "worker done: all folders reverted and restored to sendreceive"
+  stg_prune_runs "$STG_RUN"
+  exit 0
+}
+STG_FUNCS="stg_prune_runs stg_newest_mtime stg_flag stg_log stg_api stg_left stg_fail stg_folder_ready stg_wait_ready stg_conflict_name rollback_worker"
+
+
+main() {
 usage() { echo "usage: syncthing-launcher <path to apps/syncthing.md>   (no other arguments; starts nothing otherwise)" >&2; exit 2; }
 { [ "$#" -eq 1 ] && [ -f "$1" ]; } || usage
 RECORD="$1"
@@ -14,6 +211,14 @@ LOG=$(rec log_path); COLD=$(rec cold_copy_dir); COLD2=$(rec cold_copy_extra); ME
 [ -n "$BIN" ] && [ -n "$CONF" ] && [ -n "$DATA" ] && [ -n "$API" ] || { echo "record lacks binary_path/config_dir/db_dir/api_address" >&2; exit 1; }
 OUT="${LOG:+$LOG.out}"; OUT="${OUT:-${TMPDIR:-/tmp}/syncthing-launcher.out}"   # daemon stdout/stderr (the log itself stays --log-file)
 LOCK="${TMPDIR:-/tmp}/syncthing-launcher.lock"
+
+GUARD=$(rec rollback_guard); APPDIR=$(rec app_dir)
+STG_APP_DIR=$(rec rollback_guard_dir); STG_APP_DIR=${STG_APP_DIR:-${APPDIR:+$APPDIR/rollback-guard}}
+STG_APP_DIR=${STG_APP_DIR:-$(cd "$(dirname "$RECORD")" && pwd)/../rollback-guard}
+STG_FLAG="$STG_APP_DIR/flags/syncthing-rollback.flag"; STG_LOG="$STG_APP_DIR/syncthing-rollback.log"
+MARKER="${SYNCTHING_BOOT_MARKER:-$(rec boot_marker)}"
+G=$(rec rollback_guard_gap_s); [[ "$G" =~ ^[0-9]+$ ]] && STG_GAP_S=$G
+G=$(rec rollback_guard_timeout_s); [[ "$G" =~ ^[0-9]+$ ]] && STG_TIMEOUT_S=$G
 
 healthy() {   # unauthenticated health endpoint on the local API address; no key needed
   if command -v curl >/dev/null 2>&1; then
@@ -67,6 +272,25 @@ export STNOUPGRADE=1
 if [ -n "$MEM" ]; then export GOMEMLIMIT="$MEM" GOMAXPROCS="${GOMAXPROCS:-1}" GOGC="${GOGC:-40}"; fi
 LOGARG=(); [ -n "$LOG" ] && LOGARG=(--log-file="$LOG")
 
+# Rollback guard: acts only when rollback_detect fires; otherwise a no-op.
+ROLLBACK=""; BOOT=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null || true)
+if [ "$GUARD" != false ] && [ -n "$BOOT" ] && [ -f "$CONF/config.xml" ] && REASON=$(rollback_detect "$DATA" "$BOOT" "$MARKER"); then
+  STG_RUN="$STG_APP_DIR/runs/syncthing-rollback-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$STG_RUN"; chmod 700 "$STG_APP_DIR" "$STG_APP_DIR/runs" "$STG_RUN" 2>/dev/null || true
+  stg_log "ROLLBACK DETECTED: $REASON; run=$STG_RUN"
+  echo "rollback detected ($REASON): starting sendreceive folders as receiveonly; recovery runs in background, log $STG_LOG" >&2
+  cp -a "$CONF/config.xml" "$STG_RUN/config.xml.pre-rollback-guard"
+  if ! stg_set_receiveonly "$CONF/config.xml" "$STG_RUN/folders.txt" 2>>"$STG_LOG"; then
+    stg_flag failed "rollback detected but config.xml could not be switched to receiveonly; Syncthing NOT started"
+    stg_log "could not switch to receiveonly; NOT starting Syncthing"
+    echo "rollback detected but could not switch folders to receiveonly; not starting (see $STG_FLAG)" >&2
+    stg_prune_runs "$STG_RUN"; exit 1
+  fi
+  stg_log "switched to receiveonly before start: $(tr '\n' ' ' <"$STG_RUN/folders.txt")"
+  stg_flag in-progress "rollback detected; started receiveonly; worker pending"
+  ROLLBACK="$BOOT"
+fi
+
 # Fully detached: own session (setsid), immune to SIGHUP (nohup), stdin from /dev/null, no inherited fds,
 # so the shell or tool call that ran this can exit or be aborted without stopping Syncthing.
 # Syncthing's monitor process stays on (no --no-restart) and restarts the child after a crash.
@@ -79,7 +303,22 @@ LOGARG=(); [ -n "$LOG" ] && LOGARG=(--log-file="$LOG")
     --no-browser --no-upgrade --gui-address="$API" "${LOGARG[@]}" </dev/null >>"$OUT" 2>&1
 ) &
 PID=$!
+if [ -n "$ROLLBACK" ]; then   # detached recovery worker (same detach rules as the daemon)
+  (
+    for fd in /proc/self/fd/*; do
+      n=${fd##*/}
+      case "$n" in 0|1|2) ;; *) eval "exec $n>&-" 2>/dev/null || true ;; esac
+    done
+    export -f $STG_FUNCS; export STG_GAP_S STG_TIMEOUT_S STG_APP_DIR STG_FLAG STG_LOG   # worker env only
+    exec setsid nohup bash -c 'rollback_worker "$@"' rollback_worker "$STG_RUN" "$API" "$CONF/config.xml" "$ROLLBACK" \
+      </dev/null >>"$STG_RUN/worker.out" 2>&1
+  ) &
+fi
 exec 9>&-
 if wait_healthy 20 "$PID"; then echo "syncthing started (pid $PID) and healthy" >&2; exit 0; fi
 echo "syncthing not healthy within 20s (pid $PID); see $OUT${LOG:+ and $LOG}" >&2
 exit 1
+}
+
+# Executed: run. Sourced (offline tests): define the functions only.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
