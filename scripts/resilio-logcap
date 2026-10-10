@@ -1,0 +1,21 @@
+#!/bin/bash
+# Usage: resilio-logcap <path to apps/resilio.md>
+# Size-caps Resilio's own log (record key log_path) without restarting it. If the log is over 5 MiB, keep the last ~1 MiB,
+# truncating IN PLACE (same inode, so the daemon's open descriptors keep working; its main writer appends). No rotated copies.
+# Keeps mode 600. Touches only that one file. Lines written between the tail and the truncate are lost (it is a debug log).
+set -euo pipefail
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "usage: resilio-logcap <path to apps/resilio.md>" >&2; exit 2; }
+RECORD="$1"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
+LOG=$(rec log_path); [ -n "$LOG" ] || { echo "record needs log_path" >&2; exit 2; }
+MAX=$((5*1024*1024)); KEEP=$((1024*1024))
+[ -f "$LOG" ] && [ ! -L "$LOG" ] || { echo "no log to cap" >&2; exit 0; }
+chmod 600 "$LOG"
+size=$(stat -c %s "$LOG")
+[ "$size" -gt "$MAX" ] || { echo "log ${size} B, under cap" >&2; exit 0; }
+exec 9>"$LOG.logcap.lock"; flock -n 9 || exit 0
+tmp=$(mktemp "$LOG.logcap.XXXXXX"); trap 'rm -f "$tmp"' EXIT; chmod 600 "$tmp"
+tail -c "$KEEP" "$LOG" | tail -n +2 >"$tmp"          # drop the partial first line
+: >"$LOG"; cat "$tmp" >>"$LOG"
+chmod 600 "$LOG"
+echo "log capped: ${size} B -> $(stat -c %s "$LOG") B" >&2

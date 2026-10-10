@@ -1,0 +1,38 @@
+#!/bin/bash
+# Usage: resilio-health <path to apps/resilio.md>
+# Cheap health checks for the daily check. Prints only non-secret fields. Exit 0 healthy, 1 not healthy, 2 usage.
+# Record keys: api_address (loopback host:port), login_user, login_secret_file (read in memory only, never printed), log_path.
+# "webui_auth FAILED" can also mean the web login or terms were never set up (health unknown, not necessarily down).
+set -u
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "usage: resilio-health <path to apps/resilio.md>" >&2; exit 2; }
+RECORD="$1"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
+API=$(rec api_address); USER_=$(rec login_user); LOGIN=$(rec login_secret_file); LOG=$(rec log_path)
+[ -n "$API" ] && [ -n "$USER_" ] && [ -n "$LOGIN" ] || { echo "record needs api_address, login_user, login_secret_file" >&2; exit 2; }
+PORT=${API##*:}; rc=0
+pid=$(pgrep -u "$(id -u)" -x rslsync | head -1)
+[ -n "$pid" ] && echo "process: up pid $pid rss_kb $(awk '/VmRSS/{print $2}' /proc/$pid/status)" || { echo "process: DOWN"; rc=1; }
+ss -ltn | grep -q "${API%:*}:$PORT " && echo "webui_port: listening $API" || { echo "webui_port: NOT listening"; rc=1; }
+echo "webui_noauth_http: $(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$API/gui/token.html")  (401 expected)"
+[ -n "$LOG" ] && echo "log_recent_errors: $(tail -n 2000 "$LOG" 2>/dev/null | grep -av 'API: ' | grep -aciE 'exception|fatal|crash|assert' || true) (fatal-type lines, last 2000; socket 'error' lines are routine noise, informational only)"
+python3 - "$LOGIN" "$API" "$USER_" <<'PY' || rc=1
+import urllib.request,base64,re,json,sys,http.cookiejar
+pw=open(sys.argv[1]).read().strip(); B='http://'+sys.argv[2]
+op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+H={'Authorization':'Basic '+base64.b64encode((sys.argv[3]+':'+pw).encode()).decode()}
+def get(u):
+    return op.open(urllib.request.Request(B+u,headers=H),timeout=5).read().decode()
+try:
+    tok=re.search(r">([^<]{20,})<",get('/gui/token.html?t=1')).group(1)
+    J=lambda a,x='': json.loads(get('/gui/?action=%s&token=%s&t=3%s'%(a,tok,x)))
+    st=J('getstatuses')['value']
+    print("webui_auth: OK status errors=%s warnings=%s loading=%s down=%s up=%s"%(st['errors'],st['warnings'],st['loading'],st['speed']['downspeed'],st['speed']['upspeed']))
+    lic=J('getlicenseinfo')['value']; pz=J('pause')['value']; ds=J('getmfdevices')['value']
+    print("app: version=%s paused=%s licence_valid=%s allowed_to_sync=%s peers_online=%d/%d"%(J('version')['value'],bool(pz.get('sources')),lic.get('valid'),lic.get('allowed_to_sync'),sum(1 for d in ds if d.get('online') and not d.get('self')),sum(1 for d in ds if not d.get('self'))))
+    if not lic.get('valid') or not lic.get('allowed_to_sync'): print("WARNING: licence not valid/allowed"); sys.exit(1)
+    for f in J('getsyncfolders','&discovery=1')['folders']:
+        print("folder %s: files=%s local_files=%s size=%s error=%s paused=%s indexing=%s peers_online=%s queue_dl=%s queue_ul=%s"%(f['name'],f['files'],f['local_files'],f['local_size'],f['error'],f['paused'],f['indexing'],f['onlinepeerscount'],f['queue_download_files'],f['queue_upload_files']))
+except Exception as e:
+    print("webui_auth: FAILED", type(e).__name__); sys.exit(1)
+PY
+exit $rc

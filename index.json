@@ -36,6 +36,22 @@
         "scripts/restore-guard"
       ],
       "summary": "Newest stable from GitHub, durable device ID/DB/folders, owner-confirmed pairing, never auto-accepts devices or folders."
+    },
+    {
+      "id": "resilio",
+      "name": "Resilio Sync",
+      "template": "apps/resilio/runbook.md",
+      "scripts": [
+        "scripts/start-resilio",
+        "scripts/resilio-install",
+        "scripts/resilio-restore",
+        "scripts/snapshot-resilio-identity",
+        "scripts/resilio-health",
+        "scripts/resilio-logcap",
+        "scripts/resilio-api",
+        "scripts/restore-guard"
+      ],
+      "summary": "Headless Resilio Sync 3.x: signed-chain install, durable-first persistence incl. databases (clean-stop cold copy), owner-confirmed identity pairing, secret-safe web API helper, health and log cap."
     }
   ],
   "scripts": [
@@ -45,9 +61,44 @@
       "sha256": "b8550524170daf307d0b356361f5ea33d3cd3b62400d18e60cac77935e3db877"
     },
     {
+      "path": "scripts/resilio-api",
+      "purpose": "Secret-safe client for Resilio's undocumented local web API (python3, no dependencies): token/cookie/basic auth handled internally; read commands (status, folders, peers, license, settings, advanced, history, version), safe writes (pause, resume, rescan, rename-device, whitelisted settings, selective sync, folder prefs) and guarded risky ones (add-folder, remove-folder need explicit flags). Filters keys, tokens and ids; caps output.",
+      "sha256": "9c6edd96ddbcd39b0158f6fb493bf79cd9e735d5285fa453222d334d31aee20a"
+    },
+    {
+      "path": "scripts/resilio-health",
+      "purpose": "Resilio health check for the daily check: process, loopback port, unauthenticated 401, authenticated status, licence, peers and per-folder summary. Prints non-secret fields only; exit 0 healthy.",
+      "sha256": "c8188d57ab8438abb876643ff50f6740b8df7e161614fd33ded2319ff73b76d3"
+    },
+    {
+      "path": "scripts/resilio-install",
+      "purpose": "Installs the Resilio Sync binary only if missing (never upgrades) through a signed chain: pinned vendor key fingerprint, signed InRelease, Packages and .deb hashes, binary identical to the CDN tarball's, version string check. Version from RESILIO_VERSION or the record's installed_version.",
+      "sha256": "9316620c2b14271a9220c3b99d2ff70094f782353ca5adeb794770396c934f3a"
+    },
+    {
+      "path": "scripts/resilio-logcap",
+      "purpose": "Caps Resilio's own log at about 1 MiB when over 5 MiB, truncating in place (no restart, mode 600, no rotated copies). Touches only the record's log_path.",
+      "sha256": "816c07aa84e520e7de73a821429cb19d3ceec1cfd192cb55cfb153e634b181f7"
+    },
+    {
+      "path": "scripts/resilio-restore",
+      "purpose": "Resilio restore helper for restore-guard (record key restore_helper): durable-first. Changes nothing when live state is present and every database passes integrity_check (on temp copies); otherwise moves it aside and restores one consistent set from the cold copy (databases only from a clean-stop copy). Exit 3 = nothing usable anywhere.",
+      "sha256": "74fb43e251382bfe6499e4554f1b1a502f497244306be350d99bfe1e63e3a6e2"
+    },
+    {
       "path": "scripts/restore-guard",
-      "purpose": "Restore safeguards: preflight, link (moves existing items aside), rollback, commit, prune (max two leftovers per path, never in-use items). Never deletes or overwrites existing data.",
-      "sha256": "ddc8c8eb3f2511846e69af1e639c0389c2a68f359770cba7b61bcfd297300665"
+      "purpose": "Restore safeguards: preflight (optionally delegating to an app's restore_helper), link (moves existing items aside), rollback, commit, prune (max two leftovers per path, never in-use items). Never deletes or overwrites existing data.",
+      "sha256": "a8b49b34e697913fa63d6b29c6ef35ef9cd2d9efe75bb7368f60d2b341352ce5"
+    },
+    {
+      "path": "scripts/snapshot-resilio-identity",
+      "purpose": "Resilio cold-copy helper: light refresh while running (config, settings, sync.dat, identity, licence, login secret) or --with-db (clean stop, copies every database and each folder's .sync metadata, cmp-verifies, restarts). Max two copies; refuses unsafe, synced or unmarked destinations.",
+      "sha256": "e59d2e169eb457cb238f3edcfffd1fa2e7d8dc6541f7aeb50ca448ad773b5a0c"
+    },
+    {
+      "path": "scripts/start-resilio",
+      "purpose": "Resilio Sync launcher: refuses unknown arguments, exits 0 at once when the web UI answers, starts fully detached (setsid nohup, own session, inherited fds closed, umask 077 so the log is mode 600) and waits for it; installs, upgrades and restores nothing; never touches the databases; manages only Resilio.",
+      "sha256": "cbdf626e6a9b27a064f8a1d65eb99441c4a23ef1d71b8b4f8a63ab2c82429d0e"
     },
     {
       "path": "scripts/syncthing-launcher",

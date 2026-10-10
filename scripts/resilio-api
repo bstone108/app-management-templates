@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""resilio-api: small, secret-safe client for Resilio Sync's local web API (v3, undocumented: treat changes as "unknown").
+Usage: resilio-api [--record <app record>] [--max <chars>] <command> [args]
+Config comes from the app record (env RESILIO_RECORD, --record, or <this dir>/../apps/resilio.md): api_address (host:port, loopback),
+login_secret_file (read in memory only), login_user. Never prints the password, token, cookies, folder keys or licence ids.
+Read:   status | folders | peers | license | settings | advanced [name] | history [n] | version
+Write (safe):   pause | resume (GLOBAL: pauses every folder) | rescan <folder> | rename-device <name> | set <key> <value> (whitelist)
+                set-advanced <name> <value> (only names already listed by `advanced`) | selective <folder> on|off
+                folder-pref <folder> <transferpriority|relay|usetracker|searchlan|usehosts> <value>
+Write (risky; each needs its explicit flag):
+                add-folder <existing dir> --yes-add      creates a NEW share (new key) in this identity; it syncs to the identity's other devices
+                remove-folder <folder> --yes-remove      removes the folder from Resilio ONLY (never deletes files); refuses folders listed in the
+                                                         record's data_folders unless --really-data-folder is also given
+Exit: 0 ok, 1 failed / unexpected response (treat as "health unknown"), 2 usage or refused.
+"""
+import sys, os, re, json, base64, time, urllib.request, urllib.parse, urllib.error, http.cookiejar
+
+MAXC = 4000
+SECRET_KEY = re.compile(r'secret|token|pass|hash|licen[sc]e|key|link|cert|salt|email|owner_id|support_id|cookie|^id$|userid|macaddress', re.I)
+KEEP_ID_FIELDS = {'id', 'folderid', 'share_id'}
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr); sys.exit(code)
+
+def rec_value(path, key):
+    try:
+        for line in open(path, encoding='utf-8', errors='replace'):
+            m = re.match(r'^%s:\s*(.*)$' % re.escape(key), line)
+            if m:
+                v = re.sub(r'\s*#.*$', '', m.group(1)).strip().strip('"')
+                return v
+    except OSError:
+        pass
+    return ''
+
+def mask(o, top=True):
+    """Filter secrets: drop secret-named fields, mask long base32 keys, cap list lengths."""
+    if isinstance(o, dict):
+        out = {}
+        for k, v in o.items():
+            if k in ('secret', 'readonlysecret', 'encryptedsecret') or (SECRET_KEY.search(k) and k not in KEEP_ID_FIELDS and not isinstance(v, (bool, int, float, dict, list))):
+                continue
+            if k in ('users', 'features') : continue
+            out[k] = mask(v, False)
+        return out
+    if isinstance(o, list):
+        return [mask(x, False) for x in o[:50]]
+    if isinstance(o, str):
+        return re.sub(r'\b[A-Z2-7]{26,}\b', '<key>', o)[:200]
+    return o
+
+class Api:
+    def __init__(self, rec):
+        addr = rec_value(rec, 'api_address') or ''
+        user = rec_value(rec, 'login_user')
+        pwf = rec_value(rec, 'login_secret_file')
+        if not (addr and user and pwf):
+            die('record needs api_address, login_user and login_secret_file (record: %s)' % rec)
+        if not re.match(r'^(127\.0\.0\.1|localhost|\[::1\]):\d+$', addr):
+            die('api_address must be loopback host:port (refusing %s)' % addr)
+        self.base = 'http://' + addr
+        try:
+            pw = open(os.path.expanduser(pwf), encoding='utf-8').read().strip()
+        except OSError:
+            die('cannot read the login secret file', 1)
+        self.auth = {'Authorization': 'Basic ' + base64.b64encode((user + ':' + pw).encode()).decode()}
+        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.tok = None
+        self.data_paths = [p.strip() for p in re.findall(r'path:\s*([^,}\]]+)', rec_value(rec, 'data_folders'))]
+    def _get(self, url, timeout=8):
+        try:
+            r = self.op.open(urllib.request.Request(self.base + url, headers=self.auth), timeout=timeout)
+            return r.status, r.read().decode('utf-8', 'replace')
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode('utf-8', 'replace')
+        except (urllib.error.URLError, OSError) as e:
+            die('web UI not reachable (%s)' % type(e).__name__, 1)
+    def token(self):
+        s, t = self._get('/gui/token.html?t=%d' % int(time.time() * 1000))
+        m = re.search(r">([^<]{20,})<", t) if s == 200 else None
+        if not m:
+            die('auth failed or terms/login not set up (HTTP %s): health unknown' % s, 1)
+        self.tok = m.group(1)
+    def call(self, action, **p):
+        if not self.tok: self.token()
+        q = {'action': action, 'token': self.tok, 't': str(int(time.time() * 1000))}
+        q.update(p)
+        s, t = self._get('/gui/?' + urllib.parse.urlencode(q))
+        if s == 400 and 'invalid request' in t:  # token went stale: one retry with a fresh one
+            self.token(); q['token'] = self.tok
+            s, t = self._get('/gui/?' + urllib.parse.urlencode(q))
+        try:
+            j = json.loads(t)
+        except ValueError:
+            die('unexpected non-JSON response to %s (HTTP %s): health unknown' % (action, s), 1)
+        if s != 200 or (isinstance(j, dict) and j.get('status', 200) != 200):
+            die('%s failed: HTTP %s %s' % (action, s, str(j.get('error', ''))[:100] if isinstance(j, dict) else ''), 1)
+        return j
+    def folders(self):
+        j = self.call('getsyncfolders', discovery='1')
+        if not isinstance(j, dict) or not isinstance(j.get('folders'), list):
+            die('unexpected getsyncfolders shape: health unknown', 1)
+        return j['folders']
+    def find(self, ref):
+        fs = [f for f in self.folders() if ref in (f.get('id'), f.get('name'), f.get('path'))]
+        if len(fs) != 1:
+            die('folder "%s" not found or ambiguous (use `folders` to list ids)' % ref)
+        return fs[0]
+
+def out(o):
+    s = json.dumps(mask(o), separators=(',', ':'), ensure_ascii=False)
+    if len(s) > MAXC: s = s[:MAXC] + '...[truncated; --max N for more]'
+    print(s)
+
+FOLDER_FIELDS = ('name', 'id', 'path', 'files', 'local_files', 'size', 'local_size', 'error', 'errors', 'warnings', 'paused', 'stopped', 'indexing', 'rescanning',
+                 'status', 'synclevel', 'iswritable', 'onlinepeerscount', 'queue_download_files', 'queue_download_size', 'queue_upload_files', 'queue_upload_size',
+                 'down_speed', 'up_speed', 'archive_files', 'archive_size', 'locked_files', 'transferpriority', 'last_modified')
+SETTINGS_WHITELIST = {'devicename', 'dlrate', 'ulrate', 'defaultsynclevel', 'debug_logging', 'check_update', 'show_notifications', 'portmapping', 'listeningport'}
+FOLDER_PREFS = {'transferpriority', 'relay', 'usetracker', 'searchlan', 'usehosts'}
+
+def main(argv):
+    global MAXC
+    rec = os.environ.get('RESILIO_RECORD', '')
+    args = list(argv)
+    while args and args[0] in ('--record', '--max'):
+        if len(args) < 2: die(__doc__)
+        if args[0] == '--record': rec = args[1]
+        else:
+            if not args[1].isdigit(): die('--max needs a number')
+            MAXC = min(int(args[1]), 200000)
+        args = args[2:]
+    if not args or args[0] in ('-h', '--help', 'help'):
+        print(__doc__); sys.exit(0 if args else 2)
+    if not rec:
+        rec = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'apps', 'resilio.md')
+    if not os.path.isfile(rec): die('app record not found: %s (set RESILIO_RECORD or --record)' % rec)
+    cmd, a = args[0], args[1:]
+    flags = {x for x in a if x.startswith('--yes') or x == '--really-data-folder'}
+    a = [x for x in a if x not in flags]
+    api = Api(rec)
+    if cmd == 'status':
+        st = api.call('getstatuses').get('value', {})
+        fl = api.folders(); pz = api.call('pause').get('value', {})
+        out({'status': st, 'paused': bool(pz.get('sources')), 'version': api.call('version').get('value'), 'folders': [{k: f.get(k) for k in ('name', 'id', 'files', 'error', 'paused', 'indexing', 'onlinepeerscount') if k in f} for f in fl]})
+    elif cmd == 'folders':
+        out([{k: f[k] for k in FOLDER_FIELDS if k in f} for f in api.folders()])
+    elif cmd == 'peers':
+        ds = api.call('getmfdevices').get('value')
+        if not isinstance(ds, list): die('unexpected getmfdevices shape: health unknown', 1)
+        out([{k: d.get(k) for k in ('name', 'devicename', 'online', 'self', 'ipaddress', 'lastseen', 'lastsynccompleted', 'syncerr', 'syncerrmsg', 'syncversion', 'usedbysync', 'freespace', 'totalspace', 'folders')} for d in ds])
+    elif cmd == 'license':
+        v = api.call('getlicenseinfo').get('value', {})
+        out({k: v.get(k) for k in ('valid', 'allowed_to_sync', 'type', 'owner_type', 'expiration_date', 'remaining_time', 'max_seats', 'auto_renew')})
+    elif cmd == 'settings': out(api.call('settings').get('value'))
+    elif cmd == 'advanced':
+        adv = api.call('advancedsettings').get('value')
+        out({x['name']: x['value'] for x in adv if not a or x['name'] in a})
+    elif cmd == 'history':
+        n = int(a[0]) if a and a[0].isdigit() else 20
+        out(api.call('history', start='0', length=str(min(n, 200))).get('value'))
+    elif cmd == 'version': out(api.call('version').get('value'))
+    elif cmd == 'pause': api.call('setpause', value='true'); print('paused (all folders)')
+    elif cmd == 'resume': api.call('setpause', value='false'); print('resumed')
+    elif cmd == 'rescan':
+        if len(a) != 1: die('usage: rescan <folder>')
+        api.call('rescanfolder', id=api.find(a[0])['id']); print('rescan requested')
+    elif cmd == 'rename-device':
+        if len(a) != 1 or not re.match(r'^[A-Za-z0-9._ -]{1,40}$', a[0]): die('usage: rename-device <name> (1-40 chars, letters digits . _ - space)')
+        api.call('setsettings', devicename=a[0]); print('device name set')
+    elif cmd == 'set':
+        if len(a) != 2 or a[0] not in SETTINGS_WHITELIST: die('usage: set <%s> <value>' % '|'.join(sorted(SETTINGS_WHITELIST)))
+        if a[0] == 'defaultsynclevel' and a[1] not in ('0', '1', '2'): die('defaultsynclevel is 0, 1 or 2 (0 = new folders stay disconnected)')
+        if a[0] in ('dlrate', 'ulrate') and not re.match(r'^-?\d+$', a[1]): die('rates are integers in kB/s, -1 = unlimited')
+        api.call('setsettings', **{a[0]: a[1]}); print('set %s' % a[0])
+    elif cmd == 'set-advanced':
+        if len(a) != 2: die('usage: set-advanced <name> <value>')
+        names = {x['name'] for x in api.call('advancedsettings').get('value', [])}
+        if a[0] not in names: die('unknown advanced setting (list them with `advanced`)')
+        api.call('setadvancedsettings', **{a[0]: a[1]}); print('set advanced %s (some need a restart)' % a[0])
+    elif cmd == 'selective':
+        if len(a) != 2 or a[1] not in ('on', 'off'): die('usage: selective <folder> on|off')
+        api.call('setselectivesync', folderid=api.find(a[0])['id'], selectivesync='true' if a[1] == 'on' else 'false'); print('selective sync %s' % a[1])
+    elif cmd == 'folder-pref':
+        if len(a) != 3 or a[1] not in FOLDER_PREFS: die('usage: folder-pref <folder> <%s> <value>' % '|'.join(sorted(FOLDER_PREFS)))
+        api.call('setfolderpref', id=api.find(a[0])['id'], **{a[1]: a[2]}); print('folder pref %s set' % a[1])
+    elif cmd == 'add-folder':
+        if len(a) != 1 or '--yes-add' not in flags: die('usage: add-folder <existing dir> --yes-add   (creates a NEW share with a new key; it will sync to this identity\'s other devices)')
+        p = os.path.realpath(a[0])
+        if not os.path.isdir(p) or p in ('/', os.path.expanduser('~')): die('refusing: not an existing, non-root, non-home directory')
+        if any(f.get('path') and (p == f['path'] or p.startswith(f['path'].rstrip('/') + '/') or f['path'].startswith(p.rstrip('/') + '/')) for f in api.folders()):
+            die('refusing: path overlaps an existing Resilio folder')
+        j = api.call('addsyncfolder', path=p); print('folder added: id %s' % j.get('value', {}).get('folderid'))
+    elif cmd == 'remove-folder':
+        if len(a) != 1 or '--yes-remove' not in flags: die('usage: remove-folder <folder> --yes-remove   (removes it from Resilio and from the identity\'s other devices; never deletes files here)')
+        f = api.find(a[0])
+        prot = [d for d in api.data_paths if d and os.path.realpath(d) == os.path.realpath(f.get('path', '/nonexistent'))]
+        if prot and '--really-data-folder' not in flags: die('refusing: this folder is listed in the record\'s data_folders (add --really-data-folder if the owner approved)')
+        api.call('removefolder', folderid=f['id'], deletedirectory='false', fromalldevices='true'); print('folder removed from Resilio (files untouched)')
+    else:
+        die('unknown command: %s\n%s' % (cmd, __doc__))
+
+if __name__ == '__main__':
+    try: main(sys.argv[1:])
+    except BrokenPipeError: pass

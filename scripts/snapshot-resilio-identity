@@ -1,0 +1,89 @@
+#!/bin/bash
+# Usage: snapshot-resilio-identity <path to apps/resilio.md> [--with-db]
+# Cold copy of ALL Resilio state (one cold copy; the live files on durable storage are the other => at most two copies).
+#   live:  config_dir/config.json, state_dir/* (storage_path), and <synced folder>/.sync metadata
+#   cold:  cold_copy_dir (dirs 700, files 600, marked .app-mgmt-cold-copy)
+# Resilio keeps its per-folder SQLite databases (*.db, *.files.db, *.sf.db, -wal/-shm) locked while running, so a copy of a running
+# instance is NOT consistent. Two modes:
+#   (default)   light refresh while running: config.json, settings.dat, sync.dat, .SyncUser*/, License/, login secret.
+#               Databases and .sync metadata already in the cold copy are LEFT AS THEY ARE (never half-copied).
+#   --with-db   full refresh: cleanly stops Resilio (SIGTERM, waits for exit so the WAL is checkpointed and sync.dat saved), copies
+#               everything incl. every state_dir/*.db(+wal/shm) and each synced folder's .sync/ metadata (ID, IgnoreList,
+#               StreamsList, root_acl_entry; NEVER Archive/ or temp files), verifies with cmp, then restarts via start_command.
+#               Downtime = a few seconds. Aborts without copying if Resilio will not stop (never kill -9).
+# NOT kept: logs, sync.lng, *.old, pid/port files, FileDelayConfig, debug.txt, .sync/Archive.
+# Record keys: config_dir, state_dir, api_address, login_user, login_secret_file, cold_copy_dir, start_command, durable_root (optional guard).
+set -euo pipefail
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] && [ -f "$1" ] || { echo "usage: snapshot-resilio-identity <path to apps/resilio.md> [--with-db]" >&2; exit 2; }
+RECORD="$1"; WITHDB=0
+case "${2:-}" in "") ;; --with-db) WITHDB=1 ;; *) echo "usage: snapshot-resilio-identity <path to apps/resilio.md> [--with-db]" >&2; exit 2 ;; esac
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
+CF=$(rec config_dir); ST=$(rec state_dir); API=$(rec api_address); LUSER=$(rec login_user); LOGIN=$(rec login_secret_file)
+DEST=$(rec cold_copy_dir); START=$(rec start_command); ROOT=$(rec durable_root)
+[ -n "$CF" ] && [ -n "$ST" ] && [ -n "$API" ] && [ -n "$LUSER" ] && [ -n "$LOGIN" ] && [ -n "$DEST" ] || { echo "record needs config_dir, state_dir, api_address, login_user, login_secret_file, cold_copy_dir" >&2; exit 2; }
+[ "$WITHDB" = 0 ] || [ -x "$START" ] || { echo "record start_command missing or not executable (needed to restart after --with-db)" >&2; exit 2; }
+up() { local c; c=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$API/" || true); [ -n "$c" ] && [ "$c" != 000 ]; }
+if [ "${SNAPSHOT_FORCE:-0}" != 1 ] && ! up; then echo "resilio not healthy; refusing (SNAPSHOT_FORCE=1 overrides)" >&2; exit 1; fi
+[ -s "$CF/config.json" ] && [ -s "$ST/settings.dat" ] || { echo "live essentials missing; refusing" >&2; exit 1; }
+rd=$(realpath -m "$DEST"); rcf=$(realpath -m "$CF"); rst=$(realpath -m "$ST"); rroot=$(realpath -m "${ROOT:-/nonexistent-root}")
+case "$rd" in /|"$HOME"|"$rroot"|"$rcf"|"$rcf"/*|"$rst"|"$rst"/*) echo "unsafe cold copy dir $rd; refusing" >&2; exit 1;; esac
+d=$rd; while [ "$d" != / ]; do [ -d "$d/.sync" ] && { echo "$rd is inside a synced folder $d; refusing" >&2; exit 1; }; d=$(dirname "$d"); done
+if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST")" ] && [ ! -e "$DEST/.app-mgmt-cold-copy" ]; then echo "unmarked non-empty $DEST; refusing" >&2; exit 1; fi
+umask 077
+mkdir -p "$DEST"; chmod 700 "$DEST"; touch "$DEST/.app-mgmt-cold-copy"
+
+light() {
+  cp -a "$CF/config.json" "$DEST/config.json"
+  cp -a "$ST/settings.dat" "$DEST/settings.dat"
+  if [ -f "$ST/sync.dat" ]; then cp -a "$ST/sync.dat" "$DEST/sync.dat"; else rm -f "$DEST/sync.dat"; fi
+  rm -rf "$DEST/License" "$DEST"/.SyncUser*   # replaced wholesale so the cold copy never accumulates stale items
+  if [ -d "$ST/License" ]; then cp -a "$ST/License" "$DEST/License"; fi
+  for d in "$ST"/.SyncUser*; do if [ -d "$d" ]; then cp -a "$d" "$DEST/"; fi; done
+  if [ -f "$LOGIN" ]; then cp -a "$LOGIN" "$DEST/$(basename "$LOGIN")"; fi
+}
+folder_paths() {  # synced folder paths from the live folder list (the API needs the login); the caller falls back to the cold list
+  python3 - "$LOGIN" "$API" "$LUSER" <<'PY' 2>/dev/null || true
+import urllib.request,base64,re,json,sys,http.cookiejar
+pw=open(sys.argv[1]).read().strip(); B='http://'+sys.argv[2]
+op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+H={'Authorization':'Basic '+base64.b64encode((sys.argv[3]+':'+pw).encode()).decode()}
+g=lambda u: op.open(urllib.request.Request(B+u,headers=H),timeout=5).read().decode()
+t=re.search(r">([^<]{20,})<",g('/gui/token.html?t=1')).group(1)
+for f in json.loads(g('/gui/?action=getsyncfolders&discovery=1&token=%s'%t))['folders']: print(f['path'])
+PY
+}
+
+if [ "$WITHDB" = 0 ]; then
+  light; cmp "$CF/config.json" "$DEST/config.json"
+  echo "resilio light cold copy refreshed in $DEST (databases/.sync metadata untouched; use --with-db for a consistent full copy)" >&2; exit 0
+fi
+
+# ---- full copy: clean stop first ----
+FOLDERS=$(folder_paths)
+[ -n "$FOLDERS" ] || FOLDERS=$(cat "$DEST/folders.list" 2>/dev/null || true)
+PID=$(pgrep -u "$(id -u)" -f -- "rslsync .*--config $CF/config.json " | head -1 || true)
+if [ -n "$PID" ]; then
+  kill -TERM "$PID"
+  for i in $(seq 1 60); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done
+  if kill -0 "$PID" 2>/dev/null; then echo "resilio did not stop within 30 s; NOT copying databases (never kill -9)" >&2; exit 1; fi
+fi
+restart() { "$START" "$RECORD" || echo "WARNING: start_command failed; start Resilio by hand" >&2; }
+trap restart EXIT
+light
+rm -f "$DEST/.full-copy-ok"   # invalid until the new full copy is verified (an interrupted run must not leave a marker)
+rm -rf "$DEST/db" "$DEST/folder-meta"; mkdir -p "$DEST/db" "$DEST/folder-meta"
+for f in "$ST"/*.db "$ST"/*.db-wal "$ST"/*.db-shm; do if [ -e "$f" ]; then cp -a "$f" "$DEST/db/"; fi; done
+n=0
+while IFS= read -r p; do
+  [ -n "$p" ] && [ -d "$p/.sync" ] || continue
+  n=$((n+1)); mkdir -p "$DEST/folder-meta/$n"; printf '%s\n' "$p" > "$DEST/folder-meta/$n/path"
+  for m in ID IgnoreList StreamsList root_acl_entry; do if [ -e "$p/.sync/$m" ]; then cp -a "$p/.sync/$m" "$DEST/folder-meta/$n/$m"; fi; done
+done <<<"$FOLDERS"
+printf '%s\n' "$FOLDERS" > "$DEST/folders.list"
+find "$DEST" -type d -exec chmod 700 {} +; find "$DEST" -type f -exec chmod 600 {} +
+bad=0   # verify every copied file
+for f in "$DEST"/db/*; do if [ -e "$f" ]; then cmp -s "$f" "$ST/$(basename "$f")" || bad=1; fi; done
+if [ -f "$ST/sync.dat" ]; then cmp -s "$ST/sync.dat" "$DEST/sync.dat" || bad=1; fi
+[ "$bad" = 0 ] || { echo "verify FAILED; cold copy not trusted" >&2; rm -f "$DEST/.full-copy-ok"; exit 1; }
+date '+%F %T %Z' > "$DEST/.full-copy-ok"
+echo "resilio FULL cold copy done (db files: $(ls "$DEST/db" | wc -l), $(du -sk "$DEST/db" | cut -f1) KB; folders with .sync metadata: $n)" >&2

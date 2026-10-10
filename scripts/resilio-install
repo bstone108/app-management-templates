@@ -1,0 +1,43 @@
+#!/bin/bash
+# Usage: resilio-install <path to apps/resilio.md>      (env RESILIO_VERSION=<x.y.z.build> optional)
+# Installs the Resilio Sync binary ONLY IF MISSING (never upgrades), through a signed chain:
+#   vendor key (fingerprint pinned below) -> InRelease (GOOD signature) -> Packages sha256 -> .deb sha256 ->
+#   inner rslsync sha256 == the vendor CDN tarball's rslsync sha256 -> version string check.
+# Version: RESILIO_VERSION, else the record's installed_version (reinstall after a wipe gets the same build; only if it is still
+# in the signed repo), else the repo's newest. Writes the record's binary_path (and, if set, the install_link symlink to it).
+# Needs: curl gpg dpkg-deb tar awk. Changes nothing else.
+set -euo pipefail
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "usage: resilio-install <path to apps/resilio.md>" >&2; exit 2; }
+RECORD="$1"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
+BIN=$(rec binary_path); LINK=$(rec install_link)
+[ -n "$BIN" ] || { echo "record needs binary_path" >&2; exit 2; }
+FPR="E1B42102EBECA969E30D2CA4BE66CC4C3F171DE2"; REPO=https://linux-packages.resilio.com/resilio-sync/deb
+if [ -x "$BIN" ]; then
+  echo "binary present: $(T=$(mktemp -d); cd "$T" && "$BIN" --help 2>&1 | grep -a -m1 '^Resilio Sync' || true; rm -rf "$T")" >&2   # --help run from a scratch dir: rslsync writes .sync/ into its cwd
+  if [ -n "$LINK" ] && [ ! -e "$LINK" ]; then mkdir -p "$(dirname "$LINK")"; ln -s "$BIN" "$LINK"; fi
+  exit 0
+fi
+W=$(mktemp -d); export GNUPGHOME="$W/gnupg"; mkdir -m 700 "$GNUPGHOME"; trap 'rm -rf "$W"' EXIT
+cd "$W"
+curl -fsS "$REPO/../key.asc" -o key.asc
+[ "$(gpg --show-keys --with-colons key.asc | awk -F: '/^fpr/{print $10; exit}')" = "$FPR" ] || { echo "vendor key fingerprint mismatch" >&2; exit 1; }
+gpg --import key.asc >/dev/null 2>&1
+curl -fsS "$REPO/dists/resilio-sync/InRelease" -o InRelease
+gpg --status-fd 1 --verify InRelease 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG $FPR" || { echo "InRelease signature not GOOD" >&2; exit 1; }
+gpg --decrypt InRelease 2>/dev/null >Release
+curl -fsS "$REPO/dists/resilio-sync/non-free/binary-amd64/Packages" -o Packages
+grep -A40 '^SHA256:' Release | grep -q "$(sha256sum Packages | cut -d' ' -f1) .* non-free/binary-amd64/Packages$" || { echo "Packages hash not in signed Release" >&2; exit 1; }
+VER="${RESILIO_VERSION:-$(rec installed_version)}"
+[ -n "$VER" ] || VER=$(awk '/^Version:/{print $2}' Packages | sed 's/-[0-9]*$//' | tail -1)
+FILE=$(awk -v v="$VER-1" '/^Version:/{ok=($2==v)} ok&&/^Filename:/{print $2}' Packages | head -1); DEBSHA=$(awk -v v="$VER-1" '/^Version:/{ok=($2==v)} ok&&/^SHA256:/{print $2}' Packages | head -1)
+[ -n "$FILE" ] && [ -n "$DEBSHA" ] || { echo "version $VER not in the signed Packages file (use a recorded binary backup instead)" >&2; exit 1; }
+curl -fsS "$REPO/$FILE" -o r.deb; [ "$(sha256sum r.deb | cut -d' ' -f1)" = "$DEBSHA" ] || { echo ".deb hash mismatch" >&2; exit 1; }
+dpkg-deb -x r.deb d
+curl -fsS "https://download-cdn.resilio.com/$VER/linux/x64/0/resilio-sync_x64.tar.gz" -o t.tgz; mkdir t; tar xzf t.tgz -C t
+[ "$(sha256sum d/usr/bin/rslsync | cut -d' ' -f1)" = "$(sha256sum t/rslsync | cut -d' ' -f1)" ] || { echo "tarball binary != signed .deb binary" >&2; exit 1; }
+HELP1=$(cd "$W" && "$W/t/rslsync" --help 2>&1 | grep -a -m1 "^Resilio Sync" || true)   # captured first: grep -q + pipefail would SIGPIPE the producer
+[ "$HELP1" = "Resilio Sync $(echo "$VER" | awk -F. '{print $1"."$2"."$3" ("$4")"}')" ] || { echo "version string mismatch: $HELP1" >&2; exit 1; }
+mkdir -p "$(dirname "$BIN")"; install -m 755 t/rslsync "$BIN"
+if [ -n "$LINK" ]; then mkdir -p "$(dirname "$LINK")"; ln -sfn "$BIN" "$LINK"; fi
+echo "installed $VER sha256 $(sha256sum "$BIN" | cut -d' ' -f1)" >&2

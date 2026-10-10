@@ -1,0 +1,69 @@
+#!/bin/bash
+# Usage: resilio-restore <path to apps/resilio.md> preflight      (normally called by restore-guard via the record key restore_helper)
+# ORDER (the persistence rule): the PRIMARY state is the live one on durable storage (config_dir, state_dir, reached by --config /
+# storage_path, and by the binary link). If it is present AND intact this script changes NOTHING (exit 0): the caller then relinks
+# (restore-guard link) and starts. Only when durable state is missing, partial or corrupt does it fall back to the cold copy, as one
+# consistent set.
+# Intact = config.json, settings.dat, sync.dat, identity, licence, login-secret file present AND every *.db passes SQLite
+# integrity_check (run on a temp COPY, never on live files; skipped when this instance is running, which means it is already up).
+# Never deletes or overwrites: anything in the way is moved aside as <path>.pre-restore-<ts>. Never creates a new identity.
+# Exit 0 ok; 2 usage; 3 state missing everywhere (ask the owner); anything else = failure.
+# Databases are restored only from a cold copy marked .full-copy-ok (taken after a clean stop) and only TOGETHER with each folder's
+# .sync metadata (a folder's ID is tied to the databases); a light-only cold copy never restores DBs (it would cause re-indexing and
+# unwanted duplicates) -> exit 3.
+# Record keys: config_dir, state_dir, cold_copy_dir, login_secret_file.
+set -euo pipefail
+[ "$#" -eq 2 ] && [ -f "$1" ] && [ "$2" = preflight ] || { echo "usage: resilio-restore <path to apps/resilio.md> preflight" >&2; exit 2; }
+RECORD="$1"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
+CF=$(rec config_dir); ST=$(rec state_dir); C=$(rec cold_copy_dir); LOGIN=$(rec login_secret_file); TS=$(date +%Y%m%d-%H%M%S)
+[ -n "$CF" ] && [ -n "$ST" ] && [ -n "$C" ] && [ -n "$LOGIN" ] || { echo "record needs config_dir, state_dir, cold_copy_dir, login_secret_file" >&2; exit 2; }
+need3() { echo "STOP (3): $1 -- ask the owner; nothing new was generated" >&2; exit 3; }
+[ -e "$C/.app-mgmt-cold-copy" ] || [ -s "$ST/settings.dat" ] || need3 "no cold copy and no live state"
+live_ok() { [ -s "$CF/config.json" ] && [ -s "$ST/settings.dat" ] && [ -s "$ST/sync.dat" ] && ls "$ST"/.SyncUser*/identity.dat >/dev/null 2>&1 && ls "$ST"/License/*/license.bin >/dev/null 2>&1 && ls "$ST"/*.db >/dev/null 2>&1; }
+this_running() { pgrep -u "$(id -u)" -f -- "rslsync .*--config $CF/config.json " >/dev/null 2>&1; }
+intact() {  # every live *.db passes integrity_check on a temp copy
+  this_running && return 0
+  python3 - "$ST" <<'PY'
+import sqlite3,sys,shutil,tempfile,os,glob
+st=sys.argv[1]; d=tempfile.mkdtemp(); bad=0
+for f in sorted(glob.glob(st+'/*.db')):
+    for s in ('','-wal','-shm'):
+        if os.path.exists(f+s): shutil.copy(f+s, d)
+    try:
+        r=sqlite3.connect(os.path.join(d,os.path.basename(f))).execute('pragma integrity_check').fetchone()[0]
+    except Exception as e: r=str(e)
+    if r!='ok': print('corrupt: '+os.path.basename(f)+': '+r, file=sys.stderr); bad=1
+    for x in os.listdir(d): os.remove(os.path.join(d,x))
+shutil.rmtree(d); sys.exit(bad)
+PY
+}
+if live_ok && [ -s "$LOGIN" ] && intact; then echo "resilio-restore: durable state present and intact; cold copy NOT used (relink and start)" >&2; exit 0; fi
+echo "resilio-restore: durable state missing, partial or corrupt; falling back to the cold copy" >&2
+[ -s "$C/config.json" ] && [ -s "$C/settings.dat" ] && ls "$C"/.SyncUser*/identity.dat >/dev/null 2>&1 && ls "$C"/License/*/license.bin >/dev/null 2>&1 || need3 "identity/licence/config missing live and in the cold copy ($C)"
+[ -f "$C/.full-copy-ok" ] && ls "$C"/db/*.db >/dev/null 2>&1 || need3 "cold copy has no consistent database set (.full-copy-ok / db/); restoring identity without its databases would re-index (duplicates risk)"
+[ -s "$LOGIN" ] || [ -s "$C/$(basename "$LOGIN")" ] || need3 "web login secret missing live and in the cold copy"   # checked BEFORE anything is moved aside
+aside() { [ -e "$1" ] || [ -L "$1" ] || return 0; mv -- "$1" "$1.pre-restore-$TS"; echo "moved aside: $1 -> $1.pre-restore-$TS" >&2; }
+# partial live state is never mixed with the cold copy: move the whole storage and config aside, restore one consistent set
+if [ -d "$ST" ] && [ -n "$(ls -A "$ST" 2>/dev/null)" ]; then aside "$ST"; fi
+if [ -d "$CF" ] && [ -n "$(ls -A "$CF" 2>/dev/null)" ]; then aside "$CF"; fi
+mkdir -p "$ST" "$CF"; chmod 700 "$ST" "$CF"
+cp -a "$C/config.json" "$CF/config.json"
+for f in settings.dat sync.dat; do if [ -e "$C/$f" ]; then cp -a "$C/$f" "$ST/$f"; fi; done
+if [ -d "$C/License" ]; then cp -a "$C/License" "$ST/License"; fi
+for d in "$C"/.SyncUser*; do if [ -d "$d" ]; then cp -a "$d" "$ST/"; fi; done
+for f in "$C"/db/*; do if [ -e "$f" ]; then cp -a "$f" "$ST/"; fi; done
+# per-folder .sync metadata (only the small files; never Archive); never overwrites an existing file
+for m in "$C"/folder-meta/*/; do
+  [ -f "$m/path" ] || continue; fp=$(cat "$m/path"); [ -d "$fp" ] || { echo "folder path $fp missing; skipping its .sync metadata" >&2; continue; }
+  mkdir -p "$fp/.sync"
+  for f in ID IgnoreList StreamsList root_acl_entry; do
+    [ -e "$m/$f" ] || continue
+    if [ -e "$fp/.sync/$f" ]; then cmp -s "$m/$f" "$fp/.sync/$f" || echo "WARNING: $fp/.sync/$f differs from the cold copy; left alone (check)" >&2
+    else cp -a "$m/$f" "$fp/.sync/$f"; fi
+  done
+done
+if [ ! -s "$LOGIN" ]; then (umask 077; mkdir -p "$(dirname "$LOGIN")"); install -m 600 "$C/$(basename "$LOGIN")" "$LOGIN"; fi
+find "$ST" "$CF" -type d -exec chmod 700 {} + 2>/dev/null || true
+find "$ST" "$CF" -type f -exec chmod 600 {} +
+echo "resilio-restore: state restored from the cold copy (taken $(cat "$C/.full-copy-ok"))" >&2

@@ -1,0 +1,62 @@
+#!/bin/bash
+# Usage: start-resilio <path to apps/resilio.md>
+# Starts Resilio Sync fully detached (own session) and returns: exit 0 = healthy, 1 = not healthy / binary or config missing,
+# 2 = usage error (nothing started). Idempotent: exits 0 at once when the web UI already answers. Never run it to "inspect" it.
+# Starts ONLY Resilio; installs, upgrades and restores nothing (see resilio-install and resilio-restore). Never touches the databases.
+# Record keys used: binary_path, config_dir (holds config.json), state_dir (storage_path), api_address (loopback host:port, same as
+# webui.listen in config.json), log_path (Resilio's own log; the launcher's stdout/stderr go to <log_path>.start.out).
+set -euo pipefail
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "usage: start-resilio <path to apps/resilio.md>" >&2; exit 2; }
+RECORD="$1"
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
+BIN=$(rec binary_path); CONF="$(rec config_dir)/config.json"; STORAGE=$(rec state_dir); API=$(rec api_address); RS_LOG=$(rec log_path)
+[ -n "$BIN" ] && [ -n "$CONF" ] && [ -n "$STORAGE" ] && [ -n "$API" ] && [ -n "$RS_LOG" ] || { echo "record needs binary_path, config_dir, state_dir, api_address, log_path" >&2; exit 2; }
+case "$API" in 127.0.0.1:*|localhost:*) ;; *) echo "api_address must be loopback (127.0.0.1:<port>); refusing" >&2; exit 2;; esac
+OUT_LOG="$RS_LOG.start.out"; HEALTH_URL="http://$API/"
+[ -x "$BIN" ] || { echo "rslsync binary not found or not executable: $BIN (run resilio-install)" >&2; exit 1; }
+[ -f "$CONF" ] || { echo "config missing: $CONF (restore it; not starting)" >&2; exit 1; }
+healthy() {  # the web UI answers any HTTP status
+  local code; code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || true)
+  [ -n "$code" ] && [ "$code" != 000 ]
+}
+wait_healthy() {  # $1 seconds, $2 optional pid that must stay alive
+  local i
+  for ((i = 0; i < $1 * 2; i++)); do
+    healthy && return 0
+    if [ -n "${2:-}" ] && ! kill -0 "$2" 2>/dev/null; then return 1; fi
+    sleep 0.5
+  done
+  healthy
+}
+mkdir -p "$STORAGE"; chmod 700 "$STORAGE" 2>/dev/null || true
+if healthy; then echo "resilio already healthy" >&2; exit 0; fi
+exec 9>"$RS_LOG.start.lock"
+flock -w 20 9 || echo "another start-resilio is still running; checking health anyway" >&2
+if healthy; then echo "resilio already healthy" >&2; exit 0; fi
+running_pid() {
+  local p
+  for p in $(pgrep -u "$(id -u)" -x rslsync 2>/dev/null || true); do
+    tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -qF -- "--config $CONF " && { echo "$p"; return 0; }
+  done
+  return 1
+}
+if running_pid >/dev/null; then
+  echo "resilio process exists but is not healthy yet; waiting" >&2
+  if wait_healthy 20; then exit 0; fi
+  echo "resilio process exists but is not healthy after 20s" >&2; exit 1
+fi
+# Fully detached: own session, immune to SIGHUP, no inherited fds/stdin. --nodaemon so we hold the real pid.
+(
+  for fd in /proc/self/fd/*; do
+    n=${fd##*/}
+    case "$n" in 0|1|2) ;; *) eval "exec $n>&-" 2>/dev/null || true ;; esac
+  done
+  umask 077   # new log/out files are mode 600 (the debug log holds session tokens)
+  exec setsid nohup nice -n 19 ionice -c 3 "$BIN" --config "$CONF" --nodaemon --log "$RS_LOG" \
+    </dev/null >>"$OUT_LOG" 2>&1
+) &
+PID=$!
+exec 9>&-
+if wait_healthy 30 "$PID"; then echo "resilio started (pid $PID) and healthy" >&2; exit 0; fi
+echo "resilio not healthy within 30s (pid $PID); see $OUT_LOG and $RS_LOG" >&2
+exit 1

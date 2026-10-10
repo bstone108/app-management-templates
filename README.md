@@ -21,6 +21,7 @@ apps/_generic/runbook.md          generic self-hosted app runbook: config field 
 apps/_generic/persistence-method.md   how to make an app survive computer resets
 apps/tailscale/runbook.md         Tailscale runbook (owner lifecycle, node identity, Taildrop)
 apps/syncthing/runbook.md         Syncthing runbook (install policy, pairing lifecycle, durable DB/identity)
+apps/resilio/runbook.md           Resilio Sync runbook (signed install, identity pairing, databases persisted, web API, health)
 scripts/am-validate               read-only registry/record sanity validator
 scripts/restore-guard             restore safeguards (move aside, rollback, commit, bounded prune)
 scripts/tailscale-launcher        Tailscale launcher (install only if missing, never upgrades)
@@ -28,6 +29,13 @@ scripts/taildrop-fetch            Taildrop fetch into a marked shared inbox
 scripts/taildrop-cleanup          guarded Taildrop retention cleanup
 scripts/syncthing-launcher        Syncthing start launcher (no install, no upgrade)
 scripts/syncthing-snapshot        Syncthing cold-copy helper (essentials only, max two)
+scripts/start-resilio             Resilio Sync start launcher (no install, no upgrade)
+scripts/resilio-install           Resilio Sync install-if-missing through the signed chain
+scripts/resilio-restore           Resilio restore helper for restore-guard (durable state first, cold copy only as fallback)
+scripts/snapshot-resilio-identity Resilio cold copy (light, or --with-db after a clean stop)
+scripts/resilio-health            Resilio health check (non-secret output)
+scripts/resilio-logcap            Resilio log size cap (in place, no rotation)
+scripts/resilio-api               secret-safe Resilio web API helper (python3)
 ```
 
 ## How a consuming bot uses this repo
@@ -37,4 +45,4 @@ scripts/syncthing-snapshot        Syncthing cold-copy helper (essentials only, m
 4. When the repo moves, report that newer versions exist and review the diff; adopt only after review.
 5. If the repo is unreachable, fall back to the bot's own written spec.
 
-Every script is a `bash` skeleton that reads the app's instance record, refuses unsafe targets, and never prints secrets. Test any script in a throwaway folder before installing it.
+Every script is a `bash` skeleton (`resilio-api` is a dependency-free `python3` script) that reads the app's instance record, refuses unsafe targets, and never prints secrets. Test any script in a throwaway folder before installing it.

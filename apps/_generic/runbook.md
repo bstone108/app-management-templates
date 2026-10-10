@@ -22,6 +22,7 @@ This runbook has no installation-specific values. Every `field_name` below comes
 | `launcher` / `companion_scripts` / `launcher_fallbacks` | wrapper scripts that install-if-missing, restore, and start the app |
 | `launcher_backup_dir` | durable copies of the launchers (with `SHA256SUMS.txt`) |
 | `autostart_entry` | optional desktop/service autostart file |
+| `restore_helper` | optional path of an app-specific helper (for example `resilio-restore`); `restore-guard <record> preflight` then runs `<helper> <record> preflight` instead of the generic flat-identity/DB-dir checks. Exit 3 = state missing everywhere |
 | `start_command` | the one command that starts (and, where supported, restores) the app. **It never upgrades** |
 | `run_mode` | how it runs (for example `kernel`/`userspace`, user/root) |
 | `config_dir` / `state_dir` / `state_file` / `db_dir` | identity, config, runtime state, database |

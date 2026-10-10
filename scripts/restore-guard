@@ -12,9 +12,11 @@
 # journal being committed references.
 # Exit: 0 ok, 2 validator REFUSE, 3 identity/state/DB missing everywhere (ask the owner), 4 existing item newer/bigger or an
 #       uncommitted journal from an earlier restore (ask the owner / commit or roll back first)
+# Optional record key restore_helper: path of an app-specific helper. preflight then runs "<helper> <record> preflight" instead of the generic
+# flat-identity/DB-dir checks (for apps whose state is not "identity files in config_dir plus a DB dir"; its exit 3 = state missing everywhere).
 set -euo pipefail
 RECORD="${1:?instance record path}"; ACTION="${2:?preflight|link|rollback}"
-rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]#.*//; s/^"//; s/"$//' | head -1; }
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
 NAME=$(rec name); TS=$(date +%Y%m%d-%H%M%S)
 SUDO=""; [ "$(rec run_mode)" = kernel ] && SUDO=sudo   # kernel-mode state is root-owned
 JOURNAL="${RESTORE_JOURNAL:-${TMPDIR:-/tmp}/restore-${NAME:-app}.journal}"
@@ -96,6 +98,12 @@ preflight)
   if [ -n "${VALIDATOR:-}" ] && [ -n "${APP_DIR:-}" ]; then
     out=$("$VALIDATOR" "$APP_DIR" 2>&1) || true
     if echo "$out" | grep -E "^REFUSE +(${NAME}|registry|synced) " >/dev/null; then echo "$out" | grep '^REFUSE' >&2; exit 2; fi
+  fi
+  HELPER=$(rec restore_helper)   # apps whose state is not "flat identity files in config_dir + a DB dir" (e.g. Resilio) delegate to their own helper
+  if [ -n "$HELPER" ]; then
+    [ -x "$HELPER" ] || stop 3 "restore_helper $HELPER is missing or not executable (restore it from launcher_backup_dir, sha256sum -c)"
+    RESTORE_JOURNAL_FILE="$JOURNAL" "$HELPER" "$RECORD" preflight || { rc=$?; [ "$rc" -eq 3 ] && stop 3 "restore helper: state missing everywhere" || exit "$rc"; }
+    echo "preflight OK (helper $HELPER)" >&2; exit 0
   fi
   SF=$(rec state_file); CONF=$(rec config_dir); DB=$(rec db_dir)
   if [ -n "$SF" ] && ! $SUDO test -s "$SF"; then            # durable first, cold copy second
