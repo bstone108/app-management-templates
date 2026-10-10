@@ -8,9 +8,16 @@ Write (safe):   pause | resume (GLOBAL: pauses every folder) | rescan <folder> |
                 set-advanced <name> <value> (only names already listed by `advanced`) | selective <folder> on|off
                 folder-pref <folder> <transferpriority|relay|usetracker|searchlan|usehosts> <value>
 Write (risky; each needs its explicit flag):
-                add-folder <existing dir> --yes-add      creates a NEW share (new key) in this identity; it syncs to the identity's other devices
+                add-folder <existing dir> --yes-add [--type auto|advanced|standard]
+                                                         creates a NEW share in this identity (default type auto = Advanced if the licence allows it, else
+                                                         Standard); it syncs to the identity's other devices
                 remove-folder <folder> --yes-remove      removes the folder from Resilio ONLY (never deletes files); refuses folders listed in the
                                                          record's data_folders unless --really-data-folder is also given
+Secrets (print ONLY with an explicit flag, straight to stdout, never logged or truncated; do not paste the output anywhere):
+                keys <folder> ro|rw --yes-show-key       a Standard folder's read-only or read-write key (Advanced folders have no key: use link)
+                link <folder> ro|rw [--days N] [--uses N] [--approval none|new|all] --yes-link   invitation link (defaults: ro, 1 day, 1 use, approval new)
+Approvals:      approvals                                pending access requests (filtered: no fingerprints)
+                approve <folder> <fingerprint> ro|rw|deny --yes-approve   UNTESTED against a real peer; the fingerprint comes from the raw API only
 Exit: 0 ok, 1 failed / unexpected response (treat as "health unknown"), 2 usage or refused.
 """
 import sys, os, re, json, base64, time, urllib.request, urllib.parse, urllib.error, http.cookiejar
@@ -135,6 +142,15 @@ def main(argv):
         rec = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'apps', 'resilio.md')
     if not os.path.isfile(rec): die('app record not found: %s (set RESILIO_RECORD or --record)' % rec)
     cmd, a = args[0], args[1:]
+    opts = {}
+    b = []
+    i = 0
+    while i < len(a):
+        if a[i] in ('--type', '--days', '--uses', '--approval') and i + 1 < len(a):
+            opts[a[i]] = a[i + 1]; i += 2
+        else:
+            b.append(a[i]); i += 1
+    a = b
     flags = {x for x in a if x.startswith('--yes') or x == '--really-data-folder'}
     a = [x for x in a if x not in flags]
     api = Api(rec)
@@ -184,12 +200,41 @@ def main(argv):
         if len(a) != 3 or a[1] not in FOLDER_PREFS: die('usage: folder-pref <folder> <%s> <value>' % '|'.join(sorted(FOLDER_PREFS)))
         api.call('setfolderpref', id=api.find(a[0])['id'], **{a[1]: a[2]}); print('folder pref %s set' % a[1])
     elif cmd == 'add-folder':
-        if len(a) != 1 or '--yes-add' not in flags: die('usage: add-folder <existing dir> --yes-add   (creates a NEW share with a new key; it will sync to this identity\'s other devices)')
+        if len(a) != 1 or '--yes-add' not in flags: die('usage: add-folder <existing dir> --yes-add [--type auto|advanced|standard]   (creates a NEW share; it will sync to this identity\'s other devices)')
+        ftype = opts.get('--type', 'auto')
+        if ftype not in ('auto', 'advanced', 'standard'): die('--type is auto, advanced or standard')
         p = os.path.realpath(a[0])
         if not os.path.isdir(p) or p in ('/', os.path.expanduser('~')): die('refusing: not an existing, non-root, non-home directory')
         if any(f.get('path') and (p == f['path'] or p.startswith(f['path'].rstrip('/') + '/') or f['path'].startswith(p.rstrip('/') + '/')) for f in api.folders()):
             die('refusing: path overlaps an existing Resilio folder')
-        j = api.call('addsyncfolder', path=p); print('folder added: id %s' % j.get('value', {}).get('folderid'))
+        if ftype == 'auto':
+            lic = api.call('getlicenseinfo').get('value', {})
+            ftype = 'advanced' if lic.get('valid') and lic.get('type') not in (None, 0) else 'standard'
+        # Advanced (managed, per-user permissions) = no secret parameter; Standard (classic, key based) = empty secret parameter. Verified on 3.1.2.
+        j = api.call('addsyncfolder', path=p, selectivesync='false', **({} if ftype == 'advanced' else {'secret': ''}))
+        fid = j.get('value', {}).get('folderid'); time.sleep(2)
+        got = [f for f in api.folders() if f.get('id') == fid]
+        kind = ('advanced' if got[0].get('ismanaged') else 'standard') if got else 'unknown'
+        print('folder added: id %s, type %s%s' % (fid, kind, '' if kind == ftype else ' (REQUESTED %s: check the licence)' % ftype))
+    elif cmd in ('keys', 'link'):
+        want = '--yes-show-key' if cmd == 'keys' else '--yes-link'
+        if len(a) < 2 or a[1] not in ('ro', 'rw') or want not in flags: die('usage: %s <folder> ro|rw %s%s' % (cmd, want, ' [--days N] [--uses N] [--approval none|new|all]' if cmd == 'link' else ''))
+        f = api.find(a[0])
+        if cmd == 'keys':
+            k = f.get('readonlysecret' if a[1] == 'ro' else 'secret')
+            if not k: die('this folder has no key (Advanced folders are shared by identity or by link; use the link command)', 1)
+            sys.stdout.write(k + '\n'); sys.stdout.flush()
+        else:
+            days = opts.get('--days', '1'); uses = opts.get('--uses', '1'); ap = {'none': 0, 'new': 1, 'all': 2}.get(opts.get('--approval', 'new'))
+            if not (days.isdigit() and uses.isdigit()) or ap is None: die('--days and --uses are whole numbers (0 = unlimited); --approval is none|new|all')
+            j = api.call('getsynclink', folderid=f['id'], permissions=2 if a[1] == 'ro' else 3, timelimit=int(days) * 86400, clicklimit=int(uses), askapproval=ap, type='copy', linktype='https')
+            sys.stdout.write(str(j.get('value', '')) + '\n'); sys.stdout.flush()
+    elif cmd == 'approvals':
+        j = api.call('getpendingrequests').get('value') or []
+        out([{k: r.get(k) for k in ('folderName', 'status', 'access', 'readwrite', 'approved') if k in r} | {'folder': r.get('folder')} for r in j if isinstance(r, dict)])
+    elif cmd == 'approve':
+        if len(a) != 3 or a[2] not in ('ro', 'rw', 'deny') or '--yes-approve' not in flags: die('usage: approve <folder> <fingerprint> ro|rw|deny --yes-approve   (UNTESTED against a real peer)')
+        api.call('setrequeststatus', folderid=api.find(a[0])['id'], fingerprint=a[1], status={'deny': 1, 'ro': 2, 'rw': 3}[a[2]]); print('request answered: %s' % a[2])
     elif cmd == 'remove-folder':
         if len(a) != 1 or '--yes-remove' not in flags: die('usage: remove-folder <folder> --yes-remove   (removes it from Resilio and from the identity\'s other devices; never deletes files here)')
         f = api.find(a[0])

@@ -62,8 +62,8 @@
     },
     {
       "path": "scripts/resilio-api",
-      "purpose": "Secret-safe client for Resilio's undocumented local web API (python3, no dependencies): token/cookie/basic auth handled internally; read commands (status, folders, peers, license, settings, advanced, history, version), safe writes (pause, resume, rescan, rename-device, whitelisted settings, selective sync, folder prefs) and guarded risky ones (add-folder, remove-folder need explicit flags). Filters keys, tokens and ids; caps output.",
-      "sha256": "9c6edd96ddbcd39b0158f6fb493bf79cd9e735d5285fa453222d334d31aee20a"
+      "purpose": "Secret-safe client for Resilio's undocumented local web API (python3, no dependencies): token/cookie/basic auth handled internally; read commands, safe writes (pause, resume, rescan, settings, selective sync, folder prefs), guarded risky ones (add-folder: Advanced if the licence allows else Standard; remove-folder), and key/link/approval commands that print secrets only behind explicit flags. Filters keys, tokens and ids; caps output.",
+      "sha256": "f61268ff52c3c7db816a5648149e79bca8d41bb6f00d6500505d4acd3df0f7f7"
     },
     {
       "path": "scripts/resilio-health",
