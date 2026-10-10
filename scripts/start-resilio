@@ -13,6 +13,8 @@ BIN=$(rec binary_path); CONF="$(rec config_dir)/config.json"; STORAGE=$(rec stat
 [ -n "$BIN" ] && [ -n "$CONF" ] && [ -n "$STORAGE" ] && [ -n "$API" ] && [ -n "$RS_LOG" ] || { echo "record needs binary_path, config_dir, state_dir, api_address, log_path" >&2; exit 2; }
 case "$API" in 127.0.0.1:*|localhost:*) ;; *) echo "api_address must be loopback (127.0.0.1:<port>); refusing" >&2; exit 2;; esac
 OUT_LOG="$RS_LOG.start.out"; HEALTH_URL="http://$API/"
+DATA_UMASK=$(rec data_umask); DATA_UMASK=${DATA_UMASK:-022}   # umask for the daemon (synced files); optional record key
+case "$DATA_UMASK" in 0[0-7][0-7]|[0-7][0-7][0-7]) ;; *) echo "data_umask must be 3 octal digits" >&2; exit 2;; esac
 [ -x "$BIN" ] || { echo "rslsync binary not found or not executable: $BIN (run resilio-install)" >&2; exit 1; }
 [ -f "$CONF" ] || { echo "config missing: $CONF (restore it; not starting)" >&2; exit 1; }
 healthy() {  # the web UI answers any HTTP status
@@ -45,18 +47,23 @@ if running_pid >/dev/null; then
   if wait_healthy 20; then exit 0; fi
   echo "resilio process exists but is not healthy after 20s" >&2; exit 1
 fi
+# Logs hold session tokens: pre-create them private (the daemon umask is more permissive for synced data).
+for f in "$OUT_LOG" "$RS_LOG"; do [ -L "$f" ] && rm -f "$f"; [ -e "$f" ] || install -m 600 /dev/null "$f"; chmod 600 "$f"; done
 # Fully detached: own session, immune to SIGHUP, no inherited fds/stdin. --nodaemon so we hold the real pid.
 (
   for fd in /proc/self/fd/*; do
     n=${fd##*/}
     case "$n" in 0|1|2) ;; *) eval "exec $n>&-" 2>/dev/null || true ;; esac
   done
-  umask 077   # new log/out files are mode 600 (the debug log holds session tokens)
+  umask "$DATA_UMASK"   # synced data files follow record data_umask (default 022); logs are pre-created 600 above
   exec setsid nohup nice -n 19 ionice -c 3 "$BIN" --config "$CONF" --nodaemon --log "$RS_LOG" \
     </dev/null >>"$OUT_LOG" 2>&1
 ) &
 PID=$!
 exec 9>&-
-if wait_healthy 30 "$PID"; then echo "resilio started (pid $PID) and healthy" >&2; exit 0; fi
+if wait_healthy 30 "$PID"; then
+  chmod 600 "$RS_LOG" 2>/dev/null || true   # the daemon re-chmods its log to follow the umask; the debug log holds session tokens
+  echo "resilio started (pid $PID) and healthy" >&2; exit 0
+fi
 echo "resilio not healthy within 30s (pid $PID); see $OUT_LOG and $RS_LOG" >&2
 exit 1

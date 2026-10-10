@@ -1,0 +1,69 @@
+#!/bin/bash
+# Usage: resilio-access <path to apps/resilio.md> [--check]
+# Keeps synced data folders accessible to ONE extra group (record key access_group; empty/absent = does nothing, exit 0), durably, with
+# ACLs instead of per-file fixes: a named-group ACL on everything (rwX) plus a DEFAULT ACL on directories so files Resilio creates or
+# syncs in later inherit it. "Others" are never widened: the default ACL's other entry copies the folder's existing other bits (a private
+# 770-style folder stays private; a 755 folder keeps r-x). `.sync/` internals are never touched. Directories above a data folder that
+# the group cannot traverse (for example a 700 home directory) get a traverse-only ACL (g:<group>:--x), nothing more.
+# Without the acl tools it tries `sudo -n apt-get install -y acl` once; if that is impossible it falls back to group ownership
+# (chgrp, g+rwX, setgid on directories) and says so.
+#   (default)  apply, then re-check;  --check  report only: exit 0 clean, 1 problems found, 2 usage.
+# Record keys: access_group, data_folders (list of {path: ...}). Idempotent and safe to run any time; never deletes or moves anything.
+set -euo pipefail
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] && [ -f "$1" ] || { echo "usage: resilio-access <path to apps/resilio.md> [--check]" >&2; exit 2; }
+RECORD="$1"; CHECK=0
+case "${2:-}" in "") ;; --check) CHECK=1 ;; *) echo "usage: resilio-access <path to apps/resilio.md> [--check]" >&2; exit 2 ;; esac
+rec() { sed -n "s/^$1:[[:space:]]*//p" "$RECORD" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^"//; s/"$//' | head -1; }
+G=$(rec access_group)
+case "$G" in ""|none|null) echo "access_group not set; nothing to do" >&2; exit 0;; esac
+getent group "$G" >/dev/null || { echo "group $G does not exist" >&2; exit 2; }
+id -nG | tr ' ' '\n' | grep -qx "$G" || { echo "this user is not in group $G (cannot chgrp/ACL for it); refusing" >&2; exit 2; }
+mapfile -t DIRS < <(sed -n 's/^data_folders:[[:space:]]*//p' "$RECORD" | head -1 | grep -oE 'path:[[:space:]]*[^,}]+' | sed 's/^path:[[:space:]]*//; s/[[:space:]]*$//')
+[ "${#DIRS[@]}" -gt 0 ] || { echo "no data_folders paths in the record" >&2; exit 0; }
+HAVE_ACL=0; command -v setfacl >/dev/null && HAVE_ACL=1
+if [ "$HAVE_ACL" = 0 ] && [ "$CHECK" = 0 ] && sudo -n true 2>/dev/null; then
+  echo "acl tools missing; installing the distro package 'acl' (helper dependency)" >&2
+  sudo -n apt-get install -y acl >/dev/null 2>&1 || true
+  command -v setfacl >/dev/null && HAVE_ACL=1
+fi
+[ "$HAVE_ACL" = 1 ] || echo "WARNING: no setfacl; using group ownership + setgid fallback" >&2
+problems=0
+for d in "${DIRS[@]}"; do
+  rd=$(realpath -m "$d")
+  case "$rd" in /|"$HOME"|/home|/home/*/..) echo "unsafe data folder $rd; skipping" >&2; continue;; esac
+  [ -d "$rd" ] && [ -d "$rd/.sync" ] || { echo "skip $rd (not a Resilio folder)" >&2; continue; }
+  obits=$(stat -c %a "$rd" | grep -o '.$')                                   # existing 'other' bits of the folder root
+  o=$(printf '%s%s%s' "$([ $((obits & 4)) -ne 0 ] && echo r || echo -)" "$([ $((obits & 2)) -ne 0 ] && echo w || echo -)" "$([ $((obits & 1)) -ne 0 ] && echo x || echo -)")
+  total=$(find "$rd" -path "$rd/.sync" -prune -o -print | wc -l)
+  if [ "$HAVE_ACL" = 1 ]; then
+    have=$(cd "$rd" && getfacl -R -p -s . 2>/dev/null | grep -c '^# file:' || true)   # entries that carry an extended ACL (.sync included if any)
+    miss=$((total - have)); [ "$miss" -lt 0 ] && miss=0
+    nodef=$(find "$rd" -path "$rd/.sync" -prune -o -type d -print0 | xargs -0 -r getfacl -p 2>/dev/null | grep -c '^default:group:'"$G"':' || true)
+    dirs=$(find "$rd" -path "$rd/.sync" -prune -o -type d -print | wc -l)
+    echo "$rd: $total entries, $miss without an extended ACL, $((dirs - nodef)) directories without the default ACL for $G (others: $o)" >&2
+    [ "$miss" -gt 0 ] || [ "$nodef" -lt "$dirs" ] && problems=1 || true
+    if [ "$CHECK" = 0 ]; then
+      find "$rd" -path "$rd/.sync" -prune -o -print0 | xargs -0 -r setfacl -m "g:$G:rwX"
+      find "$rd" -path "$rd/.sync" -prune -o -type d -print0 | xargs -0 -r setfacl -d -m "g:$G:rwx,m::rwx,o::$o"
+    fi
+  else
+    bad=$(find "$rd" -path "$rd/.sync" -prune -o \( ! -group "$G" -o \( -type d ! -perm -2020 \) -o \( -type f ! -perm -060 \) \) -print | wc -l)
+    echo "$rd: $bad entries without group $G access (fallback mode)" >&2; [ "$bad" -gt 0 ] && problems=1
+    if [ "$CHECK" = 0 ]; then
+      find "$rd" -path "$rd/.sync" -prune -o -print0 | xargs -0 -r chgrp "$G"
+      find "$rd" -path "$rd/.sync" -prune -o -type d -print0 | xargs -0 -r chmod g+rwxs
+      find "$rd" -path "$rd/.sync" -prune -o -type f -print0 | xargs -0 -r chmod g+rw
+    fi
+  fi
+  # traverse-only access on ancestors up to the home directory that the group could not enter
+  a=$(dirname "$rd")
+  while [ "$a" != / ] && [ "$a" != "$(dirname "$HOME")" ]; do
+    if [ $(( $(stat -c %a "$a" | grep -o '.$') & 1 )) -eq 0 ] && [ "$HAVE_ACL" = 1 ] && ! getfacl -p "$a" 2>/dev/null | grep -q "^group:$G:..x"; then
+      echo "$a: group $G cannot traverse" >&2; problems=1
+      [ "$CHECK" = 1 ] || setfacl -m "g:$G:--x" "$a"
+    fi
+    a=$(dirname "$a")
+  done
+done
+[ "$CHECK" = 0 ] && [ "$problems" = 1 ] && { echo "applied; re-run with --check to verify" >&2; exit 0; }
+exit "$problems"

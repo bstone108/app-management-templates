@@ -35,6 +35,7 @@ scripts/resilio-restore           Resilio restore helper for restore-guard (dura
 scripts/snapshot-resilio-identity Resilio cold copy (light, or --with-db after a clean stop)
 scripts/resilio-health            Resilio health check (non-secret output)
 scripts/resilio-logcap            Resilio log size cap (in place, no rotation)
+scripts/resilio-access            Resilio: optional ACL access for one extra group on the data folders
 scripts/resilio-api               secret-safe Resilio web API helper (python3)
 ```
 

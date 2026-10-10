@@ -68,7 +68,7 @@
     {
       "path": "scripts/resilio-health",
       "purpose": "Resilio health check for the daily check: process, loopback port, unauthenticated 401, authenticated status, licence, peers and per-folder summary. Prints non-secret fields only; exit 0 healthy.",
-      "sha256": "c8188d57ab8438abb876643ff50f6740b8df7e161614fd33ded2319ff73b76d3"
+      "sha256": "10ec56dd86e10c90541e5b32721a2d394042ea1caca5e2ccef600ef7a7a98a0c"
     },
     {
       "path": "scripts/resilio-install",
@@ -79,6 +79,11 @@
       "path": "scripts/resilio-logcap",
       "purpose": "Caps Resilio's own log at about 1 MiB when over 5 MiB, truncating in place (no restart, mode 600, no rotated copies). Touches only the record's log_path.",
       "sha256": "816c07aa84e520e7de73a821429cb19d3ceec1cfd192cb55cfb153e634b181f7"
+    },
+    {
+      "path": "scripts/resilio-access",
+      "purpose": "Optional: gives one extra group (record key access_group) access to a Resilio instance's synced data folders through ACLs (named-group + default ACL, others never widened, .sync untouched, traverse-only on ancestors); --check reports only. No access_group = does nothing.",
+      "sha256": "27b86a2dca75ec697f026d42f708496ac5b1b7e9d1951131768f32b849515a73"
     },
     {
       "path": "scripts/resilio-restore",
@@ -98,7 +103,7 @@
     {
       "path": "scripts/start-resilio",
       "purpose": "Resilio Sync launcher: refuses unknown arguments, exits 0 at once when the web UI answers, starts fully detached (setsid nohup, own session, inherited fds closed, umask 077 so the log is mode 600) and waits for it; installs, upgrades and restores nothing; never touches the databases; manages only Resilio.",
-      "sha256": "cbdf626e6a9b27a064f8a1d65eb99441c4a23ef1d71b8b4f8a63ab2c82429d0e"
+      "sha256": "b0b2a6757782d323d07e47bcd7f7f936922e4ea85b9123032972c71b5e78ced6"
     },
     {
       "path": "scripts/syncthing-launcher",

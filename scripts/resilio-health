@@ -31,6 +31,7 @@ try:
     print("app: version=%s paused=%s licence_valid=%s allowed_to_sync=%s peers_online=%d/%d"%(J('version')['value'],bool(pz.get('sources')),lic.get('valid'),lic.get('allowed_to_sync'),sum(1 for d in ds if d.get('online') and not d.get('self')),sum(1 for d in ds if not d.get('self'))))
     if not lic.get('valid') or not lic.get('allowed_to_sync'): print("WARNING: licence not valid/allowed"); sys.exit(1)
     for f in J('getsyncfolders','&discovery=1')['folders']:
+        if 'path' not in f: continue   # discovery=1 also lists folders merely offered by peers (not joined): skip
         print("folder %s: files=%s local_files=%s size=%s error=%s paused=%s indexing=%s peers_online=%s queue_dl=%s queue_ul=%s"%(f['name'],f['files'],f['local_files'],f['local_size'],f['error'],f['paused'],f['indexing'],f['onlinepeerscount'],f['queue_download_files'],f['queue_upload_files']))
 except Exception as e:
     print("webui_auth: FAILED", type(e).__name__); sys.exit(1)
